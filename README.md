@@ -55,3 +55,22 @@ chmod +x dirtyfrag/dirtyfrag-scanner.sh
 
 ## License
 MIT
+
+## fs-corruption-rca-collector.py
+
+Comprehensive filesystem corruption RCA log collector for Ubuntu 22.04 on Proxmox. Collects 8 categories of diagnostic data and outputs structured JSON + human-readable report + compressed archive.
+
+### Usage
+```bash
+sudo python3 fs-corruption-rca-collector.py
+```
+
+### Outputs
+- `rca-data.json` — Structured JSON for programmatic/LLM analysis
+- `rca-report.txt` — Human-readable report
+- `fs-corruption-rca-<host>-<timestamp>.tar.gz` — Compressed archive
+
+### Prerequisites
+```bash
+sudo apt update && sudo apt install -y smartmontools nvme-cli xfsprogs btrfs-progs e2fsprogs util-linux systemd zfsutils-linux
+```
