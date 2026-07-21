@@ -4,6 +4,45 @@ Collection of production-ready Bash scripts for system administration, security 
 
 ## Scripts
 
+### ssh-script-executor
+**SSH Script Executor** — Execute local scripts on remote hosts via SSH with parallel execution, connection reuse, and CSV/JSON reporting.
+
+```bash
+# Single host
+./ssh-script-executor.py --host user@server --script ./deploy.sh --args "prod us-east"
+
+# Multiple hosts from file, parallel execution
+./ssh-script-executor.py --host-file hosts.txt --script ./setup.sh --parallel 4
+
+# Dry run to preview
+./ssh-script-executor.py --host user@server --script ./setup.sh --dry-run
+
+# With CSV output
+./ssh-script-executor.py --host-file hosts.txt --script ./check.sh --csv report.csv
+
+# With stdin input
+echo "config data" | ./ssh-script-executor.py --host user@server --script ./apply.sh
+```
+
+Host file format (one per line):
+```
+user@host:port [key_file]
+host.example.com
+user@192.168.1.10 ~/.ssh/id_ed25519
+```
+
+**Features:**
+- Cross-platform (macOS + Linux)
+- Parallel execution with configurable concurrency
+- SSH ControlMaster connection reuse for speed
+- Script arguments + stdin passthrough
+- Dry-run mode for safety
+- CSV/JSON output for automation
+- Colored output with verbosity levels
+- Self-test suite (`--selftest`)
+
+---
+
 ### dirtyfrag-scanner
 **DirtyFrag/DirtClone CVE Scanner & Mitigator**
 
@@ -44,16 +83,19 @@ sudo ./dirtyfrag/dirtyfrag-scanner.sh --mitigate --force-reboot
 ```bash
 git clone https://github.com/tejasach06/bash-scripts.git
 cd bash-scripts
-chmod +x dirtyfrag/dirtyfrag-scanner.sh pmta-log-extract.py
+chmod +x dirtyfrag/dirtyfrag-scanner.sh pmta-log-extract.py ssh-script-executor.py
 ./dirtyfrag/dirtyfrag-scanner.sh --help
 ./pmta-log-extract.py --help
+./ssh-script-executor.py --help
 ```
 
 ## Requirements
 - Bash 4+
 - Linux kernel (tested on 5.15+)
 - Root for `--mitigate` (not for `--scan` or `--dry-run`)
-- Python 3.8+ (for pmta-log-extract.py)
+- Python 3.8+ (for pmta-log-extract.py, ssh-script-executor.py)
+- OpenSSH client (for ssh-script-executor.py)
+- SSH key or password authentication configured for target hosts
 
 ## License
 MIT
