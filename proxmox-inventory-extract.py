@@ -146,24 +146,28 @@ def get_vms_for_node(host, node, ticket, csrf, verify_ssl):
 
 
 def parse_disks(config):
-    """Extract (name, size_gb) tuples from VM config.
+    """Extract (storage, name, size_gb) tuples from VM config.
 
     Walks DISK_KEYS in order. Skips entries that look like CDROMs (no size= attr)
     or empty values. Size is reported in GiB; sub-GiB values round down to 0.
+    Output format: "storage:name:sizeGB" joined by MULTI_SEP.
     """
     out = []
     for key in DISK_KEYS:
         val = config.get(key)
         if not val or val == "none":
             continue
+        # val format: "local-lvm:vm-100-disk-0,size=50G"
         m = re.search(r"size=(\d+(?:\.\d+)?)\s*([KMGT])?", val)
         if not m:
             continue
+        # storage is the part before the first ':'
+        storage = val.split(":")[0] if ":" in val else "unknown"
         size_num = float(m.group(1))
         unit = m.group(2) or "G"
         size_bytes = int(size_num * SIZE_UNITS[unit])
         size_gb = size_bytes // SIZE_UNITS["G"]
-        out.append((key, int(size_gb)))
+        out.append((storage, key, int(size_gb)))
     return out
 
 
@@ -264,7 +268,18 @@ def detect_os(host, node, vmid, config, ticket, csrf, verify_ssl):
             distro = result.get("pretty-name") or result.get("name")
             version = result.get("version") or result.get("version-id")
             family = _infer_family_from_name(distro)
-            return {"os_family": family, "os_distribution": distro, "os_version": version}
+            # Extract base distribution name
+            # e.g., "Ubuntu 22.04 LTS" -> "Ubuntu", "Windows Server 2019" -> "Windows Server"
+            distro_base = None
+            if distro:
+                parts = distro.split()
+                if family == "windows" and len(parts) >= 2 and parts[1].lower() == "server":
+                    distro_base = "Windows Server"
+                elif family == "linux" and len(parts) >= 2 and parts[1].lower() in ("linux", "gnu/linux", "server", "enterprise"):
+                    distro_base = f"{parts[0]} {parts[1]}"
+                else:
+                    distro_base = parts[0]
+            return {"os_family": family, "os_distribution": distro_base, "os_version": version}
         except Exception:
             pass
 
@@ -294,7 +309,7 @@ def build_row(data):
     row["platform"] = "proxmox"
     row["cluster"] = cluster
     row["node"] = node
-    row["disks"] = MULTI_SEP.join(f"{d[0]}:{d[1]}" for d in disks)
+    row["disks"] = MULTI_SEP.join(f"{d[0]}:{d[1]}:{d[2]}" for d in disks)
     row["status"] = STATUS_MAP.get(status, "unknown")
     row["cpu_cores"] = cpu_cores
     row["memory_mb"] = memory_mb

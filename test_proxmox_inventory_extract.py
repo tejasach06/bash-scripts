@@ -148,12 +148,14 @@ def test_parse_disks_basic():
         "efidisk0": "local-lvm:vm-100-disk-2,efitype=4m,size=4M",
     }
     out = parse_disks(cfg)
-    names_sizes = {name: size for name, size in out}
-    assert names_sizes["scsi0"] == 50
-    assert names_sizes["scsi1"] == 100
-    assert names_sizes["efidisk0"] == 0
-    assert "ide2" not in names_sizes
-    assert "net0" not in names_sizes
+    # Now returns (storage, name, size_gb)
+    assert ("local-lvm", "scsi0", 50) in out
+    assert ("local-lvm", "scsi1", 100) in out
+    assert ("local-lvm", "efidisk0", 0) in out
+    # Should not include ide2 (no size) or net0 (not a disk)
+    names = [d[1] for d in out]
+    assert "ide2" not in names
+    assert "net0" not in names
 
 
 def test_parse_disks_empty():
@@ -243,7 +245,7 @@ def test_detect_os_from_agent(monkeypatch):
     cfg = {"ostype": "l26", "agent": "enabled=1"}
     out = detect_os("h", "n", 100, cfg, "t", "c", True)
     assert out["os_family"] == "linux"
-    assert out["os_distribution"] == "Ubuntu 22.04 LTS"
+    assert out["os_distribution"] == "Ubuntu"
     assert out["os_version"] == "22.04"
 
 
@@ -254,7 +256,7 @@ def test_detect_os_windows_from_agent(monkeypatch):
     )
     out = detect_os("h", "n", 100, {"agent": "1"}, "t", "c", True)
     assert out["os_family"] == "windows"
-    assert "Windows" in (out["os_distribution"] or "")
+    assert out["os_distribution"] == "Windows Server"
 
 
 def test_detect_os_falls_back_to_ostype_linux():
@@ -291,9 +293,9 @@ def test_build_row_all_fields():
         "node": "pve1",
         "config": {},
         "status": "running",
-        "os": {"os_family": "linux", "os_distribution": "Ubuntu 22.04", "os_version": "22.04"},
+        "os": {"os_family": "linux", "os_distribution": "Ubuntu", "os_version": "22.04"},
         "ips_by_role": {"private_ip": ["172.16.0.10"], "public_ip": ["202.10.20.30"], "backup_ip": ["10.0.0.1"]},
-        "disks": [("scsi0", 50), ("scsi1", 100)],
+        "disks": [("local-lvm", "scsi0", 50), ("local-lvm", "scsi1", 100)],
         "tags": ["web", "prod"],
         "fqdn": "web01.example.com",
         "cluster": "mycluster",
@@ -305,7 +307,7 @@ def test_build_row_all_fields():
     assert row["platform"] == "proxmox"
     assert row["cluster"] == "mycluster"
     assert row["node"] == "pve1"
-    assert row["disks"] == "scsi0:50#scsi1:100"
+    assert row["disks"] == "local-lvm:scsi0:50#local-lvm:scsi1:100"
     assert row["status"] == "running"
     assert row["private_ip"] == "172.16.0.10"
     assert row["public_ip"] == "202.10.20.30"
@@ -313,7 +315,7 @@ def test_build_row_all_fields():
     assert row["tags"] == "web#prod"
     assert row["fqdn"] == "web01.example.com"
     assert row["os_family"] == "linux"
-    assert row["os_distribution"] == "Ubuntu 22.04"
+    assert row["os_distribution"] == "Ubuntu"
     assert row["os_version"] == "22.04"
     assert row["memory_mb"] == 4096
     assert row["cpu_cores"] == 2
@@ -378,11 +380,11 @@ def test_extract_vm_full(monkeypatch):
     assert row["name"] == "web01"
     assert row["cluster"] == "mycluster"
     assert row["node"] == "pve1"
-    assert row["disks"] == "scsi0:50#scsi1:100"
+    assert row["disks"] == "local-lvm:scsi0:50#local-lvm:scsi1:100"
     assert row["private_ip"] == "172.16.0.10"
     assert row["backup_ip"] == "10.0.0.1"
     assert row["os_family"] == "linux"
-    assert row["os_distribution"] == "Ubuntu 22.04 LTS"
+    assert row["os_distribution"] == "Ubuntu"
     assert row["status"] == "running"
     assert row["tags"] == "web#prod"
 
@@ -404,7 +406,7 @@ def test_extract_vm_no_agent_uses_tags(monkeypatch):
 
 def test_write_csv_roundtrip(tmp_path):
     rows = [
-        {"name": "a", "platform": "proxmox", "cluster": "c", "disks": "scsi0:50#scsi1:100"},
+        {"name": "a", "platform": "proxmox", "cluster": "c", "disks": "local-lvm:scsi0:50#local-lvm:scsi1:100"},
         {"name": "b", "platform": "proxmox", "cluster": "c", "disks": ""},
     ]
     out = tmp_path / "out.csv"
@@ -414,7 +416,7 @@ def test_write_csv_roundtrip(tmp_path):
         reader = csv.DictReader(f)
         assert reader.fieldnames == CSV_HEADERS
         data = list(reader)
-    assert data[0]["disks"] == "scsi0:50#scsi1:100"
+    assert data[0]["disks"] == "local-lvm:scsi0:50#local-lvm:scsi1:100"
     assert data[1]["disks"] == ""
 
 
