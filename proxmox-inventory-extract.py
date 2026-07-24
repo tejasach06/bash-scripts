@@ -101,6 +101,29 @@ def get_ticket(host, user, password, verify_ssl=True):
     return body["data"]["ticket"], body["data"]["CSRFPreventionToken"]
 
 
+def api_get(host, path, ticket, csrf=None, verify_ssl=True, timeout=15):
+    """GET a Proxmox API endpoint and return the `data` field.
+
+    Returns {} on HTTP 404 (so callers can check truthiness). Re-raises on
+    other errors so the caller can decide whether to skip or fail.
+    """
+    from urllib.error import HTTPError
+    url = f"https://{host}{path}"
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Cookie", f"PVEAuthCookie={ticket}")
+    if csrf:
+        req.add_header("CSRFPreventionToken", csrf)
+    ctx = None if verify_ssl else ssl._create_unverified_context()
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        return body.get("data", {})
+    except HTTPError as e:
+        if e.code == 404:
+            return {}
+        raise
+
+
 if __name__ == "__main__":
     # Module loaded only to import constants and stubs in tests.
     pass

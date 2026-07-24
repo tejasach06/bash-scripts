@@ -1,26 +1,17 @@
 """Tests for proxmox-inventory-extract.py.
 
-The script filename contains a hyphen, which prevents normal `import`. We
-load it by path with importlib.
+The script filename contains a hyphen, so we use a conftest.py to load it
+by path with importlib and inject it into sys.modules. That lets test
+functions write ordinary `from proxmox_inventory_extract import ...`.
 
 Run with: python3 -m pytest test_proxmox_inventory_extract.py -v
 """
-import importlib.util
-import os
-import sys
-
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_SCRIPT_PATH = os.path.join(_THIS_DIR, "proxmox-inventory-extract.py")
-
-_spec = importlib.util.spec_from_file_location("proxmox_inventory_extract", _SCRIPT_PATH)
-_mod = importlib.util.module_from_spec(_spec)
-sys.modules["proxmox_inventory_extract"] = _mod
-_spec.loader.exec_module(_mod)
-
-parse_args = _mod.parse_args
-get_ticket = _mod.get_ticket
-IP_PREFIX_MAP = _mod.IP_PREFIX_MAP
-CSV_HEADERS = _mod.CSV_HEADERS
+from proxmox_inventory_extract import (
+    parse_args,
+    get_ticket,
+    IP_PREFIX_MAP,
+    CSV_HEADERS,
+)
 
 
 def test_parse_args_defaults():
@@ -73,3 +64,27 @@ def test_get_ticket_parses_response(monkeypatch):
     ticket, csrf = get_ticket("127.0.0.1:8006", "root@pam", "pw", verify_ssl=True)
     assert ticket == "PVE:ticket:abc"
     assert csrf == "csrf123"
+
+
+def test_api_get_returns_data(monkeypatch):
+    class FakeResp:
+        def __init__(self, body, status=200):
+            self._body = body; self.status = status
+        def read(self): return self._body.encode("utf-8")
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
+    body = '{"data":[{"node":"pve1"},{"node":"pve2"}]}'
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: FakeResp(body))
+    from proxmox_inventory_extract import api_get
+    out = api_get("127.0.0.1:8006", "/api2/json/nodes", ticket="PVE:ticket:x")
+    assert out == [{"node": "pve1"}, {"node": "pve2"}]
+
+
+def test_api_get_404_returns_empty(monkeypatch):
+    from urllib.error import HTTPError
+    from proxmox_inventory_extract import api_get
+    def raise_404(*a, **kw):
+        raise HTTPError("https://x/api2/json/n", 404, "Not Found", {}, None)
+    monkeypatch.setattr("urllib.request.urlopen", raise_404)
+    assert api_get("127.0.0.1:8006", "/api2/json/n", ticket="t") == {}
