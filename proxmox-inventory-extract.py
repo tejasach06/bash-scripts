@@ -124,6 +124,27 @@ def api_get(host, path, ticket, csrf=None, verify_ssl=True, timeout=15):
         raise
 
 
+def get_cluster_name(host, ticket, csrf, verify_ssl):
+    """Return the Proxmox cluster name, or 'standalone' if not clustered."""
+    data = api_get(host, "/api2/json/cluster/status", ticket, csrf, verify_ssl) or []
+    for entry in data:
+        if entry.get("type") == "cluster":
+            return entry.get("name", "standalone")
+    return "standalone"
+
+
+def get_nodes(host, ticket, csrf, verify_ssl):
+    """Return list of node names from /nodes."""
+    data = api_get(host, "/api2/json/nodes", ticket, csrf, verify_ssl) or []
+    return [n["node"] for n in data if "node" in n]
+
+
+def get_vms_for_node(host, node, ticket, csrf, verify_ssl):
+    """Return list of VMIDs on a given node (QEMU only, no LXC)."""
+    data = api_get(host, f"/api2/json/nodes/{node}/qemu", ticket, csrf, verify_ssl) or []
+    return [vm["vmid"] for vm in data if "vmid" in vm]
+
+
 if __name__ == "__main__":
     # Module loaded only to import constants and stubs in tests.
     pass

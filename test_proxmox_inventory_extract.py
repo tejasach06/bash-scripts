@@ -88,3 +88,42 @@ def test_api_get_404_returns_empty(monkeypatch):
         raise HTTPError("https://x/api2/json/n", 404, "Not Found", {}, None)
     monkeypatch.setattr("urllib.request.urlopen", raise_404)
     assert api_get("127.0.0.1:8006", "/api2/json/n", ticket="t") == {}
+
+
+def test_get_cluster_name_when_clustered(monkeypatch):
+    monkeypatch.setattr(
+        "proxmox_inventory_extract.api_get",
+        lambda *a, **kw: [
+            {"name": "pve1", "type": "node"},
+            {"name": "mycluster", "type": "cluster"},
+        ],
+    )
+    from proxmox_inventory_extract import get_cluster_name
+    assert get_cluster_name("h", "t", "c", True) == "mycluster"
+
+
+def test_get_cluster_name_when_standalone(monkeypatch):
+    monkeypatch.setattr(
+        "proxmox_inventory_extract.api_get",
+        lambda *a, **kw: [{"name": "pve1", "type": "node"}],
+    )
+    from proxmox_inventory_extract import get_cluster_name
+    assert get_cluster_name("h", "t", "c", True) == "standalone"
+
+
+def test_get_nodes_extracts_names(monkeypatch):
+    monkeypatch.setattr(
+        "proxmox_inventory_extract.api_get",
+        lambda *a, **kw: [{"node": "pve1"}, {"node": "pve2"}],
+    )
+    from proxmox_inventory_extract import get_nodes
+    assert get_nodes("h", "t", "c", True) == ["pve1", "pve2"]
+
+
+def test_get_vms_for_node_returns_vmids(monkeypatch):
+    monkeypatch.setattr(
+        "proxmox_inventory_extract.api_get",
+        lambda *a, **kw: [{"vmid": 100}, {"vmid": 101}],
+    )
+    from proxmox_inventory_extract import get_vms_for_node
+    assert get_vms_for_node("h", "pve1", "t", "c", True) == [100, 101]
