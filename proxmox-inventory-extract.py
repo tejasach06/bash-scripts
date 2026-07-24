@@ -370,6 +370,53 @@ def write_csv(rows, path):
     return len(rows)
 
 
+def get_password(cli_password):
+    """Resolve password: CLI arg > env var > interactive prompt."""
+    if cli_password:
+        return cli_password
+    if "PVE_PASSWORD" in os.environ:
+        return os.environ["PVE_PASSWORD"]
+    import getpass
+    return getpass.getpass("Proxmox password: ")
+
+
+def main():
+    """Entry point: parse args, authenticate, iterate nodes/VMs, write CSV."""
+    args = parse_args(sys.argv[1:])
+
+    verify_ssl = not args.insecure
+
+    print(f"Connecting to {args.host} as {args.user}...", file=sys.stderr)
+    ticket, csrf = get_ticket(args.host, args.user, args.password, verify_ssl)
+
+    print("Fetching cluster info...", file=sys.stderr)
+    cluster = get_cluster_name(args.host, ticket, csrf, verify_ssl)
+
+    print("Enumerating nodes...", file=sys.stderr)
+    nodes = get_nodes(args.host, ticket, csrf, verify_ssl)
+
+    all_rows = []
+    for node in nodes:
+        print(f"Scanning VMs on {node}...", file=sys.stderr)
+        vmids = get_vms_for_node(args.host, node, ticket, csrf, verify_ssl)
+        for vmid in vmids:
+            try:
+                row = extract_vm(args.host, node, vmid, ticket, csrf, verify_ssl, cluster)
+                all_rows.append(row)
+                print(f"  VM {vmid} ({row['name']}): {row['status']}", file=sys.stderr)
+            except Exception as e:
+                print(f"  [error] VM {vmid} on {node}: {e}", file=sys.stderr)
+
+    if args.output:
+        out_path = args.output
+    else:
+        ts = datetime.datetime.now().isoformat(timespec="seconds").replace(":", "-")
+        out_path = f"/tmp/proxmox-inventory-{ts}.csv"
+
+    write_csv(all_rows, out_path)
+    print(f"Wrote {len(all_rows)} VMs to {out_path}", file=sys.stderr)
+
+
 if __name__ == "__main__":
-    # Module loaded only to import constants and stubs in tests.
+    main()
     pass

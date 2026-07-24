@@ -426,3 +426,36 @@ def test_write_csv_escapes_special_chars(tmp_path):
         content = f.read()
     assert '"a,vm"' in content
     assert '"c""1"' in content
+
+
+def test_password_from_env(monkeypatch):
+    monkeypatch.setenv("PVE_PASSWORD", "envsecret")
+    from proxmox_inventory_extract import get_password
+    assert get_password(None) == "envsecret"
+
+
+def test_password_from_cli_overrides_env(monkeypatch):
+    monkeypatch.setenv("PVE_PASSWORD", "envsecret")
+    from proxmox_inventory_extract import get_password
+    assert get_password("clisecret") == "clisecret"
+
+
+def test_password_prompt_called(monkeypatch):
+    """If no env and no CLI, getpass.getpass is called."""
+    import getpass
+    monkeypatch.setattr(getpass, "getpass", lambda prompt: "typedsecret")
+    from proxmox_inventory_extract import get_password
+    assert get_password(None) == "typedsecret"
+
+
+def test_main_dry_run_prints_help(capsys):
+    from proxmox_inventory_extract import main
+    # No real Proxmox, but --help should exit 0
+    import sys
+    sys.argv = ["proxmox-inventory-extract.py", "--help"]
+    try:
+        main()
+    except SystemExit as e:
+        assert e.code == 0
+    out = capsys.readouterr().out
+    assert "usage:" in out.lower()
