@@ -14,6 +14,7 @@ import json
 import os
 import re
 import ssl
+import subprocess
 import sys
 import urllib.parse
 import urllib.request
@@ -187,6 +188,37 @@ def get_vm_config(host, node, vmid, ticket, csrf, verify_ssl):
     ) or {}
 
 
+def get_vm_statuses_from_qm(node):
+    """Run `qm list` on the local node and return {vmid: status} mapping.
+
+    qm list output format:
+      VMID  NAME        STATUS   MEM(MB)  BOOTDISK(GB)  PID
+      100   web01       running  4096     50            12345
+      101   legacy      stopped  2048     20            0
+    """
+    try:
+        result = subprocess.run(
+            ["qm", "list"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return {}
+
+    statuses = {}
+    for line in result.stdout.strip().split("\n")[1:]:  # skip header
+        parts = line.split()
+        if len(parts) >= 3:
+            try:
+                vmid = int(parts[0])
+                status = parts[2].lower()
+                statuses[vmid] = status
+            except (ValueError, IndexError):
+                continue
+    return statuses
+
+
 def extract_ips_from_guest_agent(iface_data):
     """Pull IPv4 addresses out of /agent/network-get-interfaces response.
 
@@ -324,13 +356,13 @@ def build_row(data):
     return row
 
 
-def extract_vm(host, node, vmid, ticket, csrf, verify_ssl, cluster):
+def extract_vm(host, node, vmid, ticket, csrf, verify_ssl, cluster, vm_statuses):
     """Orchestrate per-VM data collection and return a CSV row dict."""
     config = get_vm_config(host, node, vmid, ticket, csrf, verify_ssl)
     if not config:
         raise RuntimeError(f"empty config for VM {vmid} on {node}")
 
-    status = config.get("status", "unknown")
+    status = vm_statuses.get(vmid, "unknown")
 
     try:
         cpu_cores = int(config.get("cores", 0))
@@ -413,10 +445,14 @@ def main():
     all_rows = []
     for node in nodes:
         print(f"Scanning VMs on {node}...", file=sys.stderr)
+
+        # Get real-time statuses from qm list on this node
+        vm_statuses = get_vm_statuses_from_qm(node)
+
         vmids = get_vms_for_node(args.host, node, ticket, csrf, verify_ssl)
         for vmid in vmids:
             try:
-                row = extract_vm(args.host, node, vmid, ticket, csrf, verify_ssl, cluster)
+                row = extract_vm(args.host, node, vmid, ticket, csrf, verify_ssl, cluster, vm_statuses)
                 all_rows.append(row)
                 print(f"  VM {vmid} ({row['name']}): {row['status']}", file=sys.stderr)
             except Exception as e:

@@ -17,6 +17,7 @@ from proxmox_inventory_extract import (
     parse_disks,
     parse_tags,
     get_vm_config,
+    get_vm_statuses_from_qm,
     extract_ips_from_guest_agent,
     classify_ips,
     extract_ips_from_tags,
@@ -184,6 +185,34 @@ def test_get_vm_config_returns_dict(monkeypatch):
     assert cfg["name"] == "web01"
     assert cfg["ostype"] == "l26"
     assert cfg["tags"] == "web;prod"
+
+
+def test_get_vm_statuses_from_qm(monkeypatch):
+    import subprocess
+    class FakeResult:
+        stdout = """VMID  NAME        STATUS   MEM(MB)  BOOTDISK(GB)  PID
+100   web01       running  4096     50            12345
+101   legacy      stopped  2048     20            0
+102   paused-vm   paused   1024     10            0"""
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeResult())
+    statuses = get_vm_statuses_from_qm("pve1")
+    assert statuses == {100: "running", 101: "stopped", 102: "paused"}
+
+
+def test_get_vm_statuses_from_qm_empty(monkeypatch):
+    import subprocess
+    class FakeResult:
+        stdout = "VMID  NAME        STATUS   MEM(MB)  BOOTDISK(GB)  PID\n"
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeResult())
+    assert get_vm_statuses_from_qm("pve1") == {}
+
+
+def test_get_vm_statuses_from_qm_error(monkeypatch):
+    import subprocess
+    def boom(*a, **kw):
+        raise FileNotFoundError("qm not found")
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert get_vm_statuses_from_qm("pve1") == {}
 
 
 def test_extract_ips_from_guest_agent_filters_loopback_and_ipv6():
@@ -376,7 +405,8 @@ def test_extract_vm_full(monkeypatch):
             return {"result": {"pretty-name": "Ubuntu 22.04 LTS", "version-id": "22.04"}}
         return {}
     monkeypatch.setattr("proxmox_inventory_extract.api_get", fake_api)
-    row = extract_vm("h", "pve1", 100, "t", "c", True, "mycluster")
+    monkeypatch.setattr("proxmox_inventory_extract.get_vm_statuses_from_qm", lambda node: {100: "running"})
+    row = extract_vm("h", "pve1", 100, "t", "c", True, "mycluster", {100: "running"})
     assert row["name"] == "web01"
     assert row["cluster"] == "mycluster"
     assert row["node"] == "pve1"
@@ -398,7 +428,8 @@ def test_extract_vm_no_agent_uses_tags(monkeypatch):
                     "cores": 2, "memory": 2048, "status": "running"}
         return {}
     monkeypatch.setattr("proxmox_inventory_extract.api_get", fake_api)
-    row = extract_vm("h", "pve1", 101, "t", "c", True, "c")
+    monkeypatch.setattr("proxmox_inventory_extract.get_vm_statuses_from_qm", lambda node: {101: "running"})
+    row = extract_vm("h", "pve1", 101, "t", "c", True, "c", {101: "running"})
     assert row["private_ip"] == "172.16.0.99"
     assert row["os_family"] == "linux"
     assert row["os_distribution"] == ""
