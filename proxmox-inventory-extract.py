@@ -64,6 +64,9 @@ STATUS_MAP = {
 }
 
 # Multi-value separator inside a single CSV cell.
+# User requested "#" to avoid CSV quoting issues with ";"
+# Note: InventoryMGR's csv_import.py _parse_disks splits on ";"
+# Convert with: sed 's/#/;/g' before import if needed.
 MULTI_SEP = "#"
 
 # IPv4 regex for extracting IPs from free-form tag strings.
