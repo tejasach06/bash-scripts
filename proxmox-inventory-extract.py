@@ -309,6 +309,67 @@ def build_row(data):
     return row
 
 
+def extract_vm(host, node, vmid, ticket, csrf, verify_ssl, cluster):
+    """Orchestrate per-VM data collection and return a CSV row dict."""
+    config = get_vm_config(host, node, vmid, ticket, csrf, verify_ssl)
+    if not config:
+        raise RuntimeError(f"empty config for VM {vmid} on {node}")
+
+    status = config.get("status", "unknown")
+
+    try:
+        cpu_cores = int(config.get("cores", 0))
+    except (TypeError, ValueError):
+        cpu_cores = 0
+    try:
+        memory_mb = int(config.get("memory", 0))
+    except (TypeError, ValueError):
+        memory_mb = 0
+
+    disks = parse_disks(config)
+    tags = parse_tags(config)
+
+    agent_enabled = config.get("agent", "")
+    ips = []
+    if agent_enabled and agent_enabled not in ("0", "none", ""):
+        try:
+            ips = get_guest_agent_ips(host, node, vmid, ticket, csrf, verify_ssl)
+        except Exception as e:
+            print(f"[warn] guest agent IP fetch failed for VM {vmid}: {e}", file=sys.stderr)
+    if not ips:
+        ips = extract_ips_from_tags(tags)
+    ips_by_role = classify_ips(ips)
+
+    os_info = detect_os(host, node, vmid, config, ticket, csrf, verify_ssl) if agent_enabled \
+              else {"os_family": OSTYPE_FAMILY.get(config.get("ostype", "")),
+                    "os_distribution": None, "os_version": None}
+
+    return build_row({
+        "name": config.get("name", f"vm-{vmid}"),
+        "node": node,
+        "config": config,
+        "status": status,
+        "os": os_info,
+        "ips_by_role": ips_by_role,
+        "disks": disks,
+        "tags": tags,
+        "fqdn": config.get("name", f"vm-{vmid}"),
+        "cluster": cluster,
+        "memory_mb": memory_mb,
+        "cpu_cores": cpu_cores,
+    })
+
+
+def write_csv(rows, path):
+    """Write a list of row dicts to a CSV file. Returns number of data rows written."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS, quoting=csv.QUOTE_MINIMAL)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return len(rows)
+
+
 if __name__ == "__main__":
     # Module loaded only to import constants and stubs in tests.
     pass

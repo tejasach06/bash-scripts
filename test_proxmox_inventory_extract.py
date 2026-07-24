@@ -6,11 +6,28 @@ functions write ordinary `from proxmox_inventory_extract import ...`.
 
 Run with: python3 -m pytest test_proxmox_inventory_extract.py -v
 """
+import csv
 from proxmox_inventory_extract import (
     parse_args,
     get_ticket,
+    api_get,
+    get_cluster_name,
+    get_nodes,
+    get_vms_for_node,
+    parse_disks,
+    parse_tags,
+    get_vm_config,
+    extract_ips_from_guest_agent,
+    classify_ips,
+    extract_ips_from_tags,
+    get_guest_agent_ips,
+    detect_os,
+    build_row,
+    extract_vm,
+    write_csv,
     IP_PREFIX_MAP,
     CSV_HEADERS,
+    MULTI_SEP,
 )
 
 
@@ -49,7 +66,6 @@ def test_csv_headers_first_three():
 
 
 def test_get_ticket_parses_response(monkeypatch):
-    """Verify get_ticket extracts ticket and CSRF from a Proxmox ticket response."""
     class FakeResp:
         def __init__(self, body, status=200):
             self._body = body
@@ -76,14 +92,12 @@ def test_api_get_returns_data(monkeypatch):
 
     body = '{"data":[{"node":"pve1"},{"node":"pve2"}]}'
     monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: FakeResp(body))
-    from proxmox_inventory_extract import api_get
     out = api_get("127.0.0.1:8006", "/api2/json/nodes", ticket="PVE:ticket:x")
     assert out == [{"node": "pve1"}, {"node": "pve2"}]
 
 
 def test_api_get_404_returns_empty(monkeypatch):
     from urllib.error import HTTPError
-    from proxmox_inventory_extract import api_get
     def raise_404(*a, **kw):
         raise HTTPError("https://x/api2/json/n", 404, "Not Found", {}, None)
     monkeypatch.setattr("urllib.request.urlopen", raise_404)
@@ -98,7 +112,6 @@ def test_get_cluster_name_when_clustered(monkeypatch):
             {"name": "mycluster", "type": "cluster"},
         ],
     )
-    from proxmox_inventory_extract import get_cluster_name
     assert get_cluster_name("h", "t", "c", True) == "mycluster"
 
 
@@ -107,7 +120,6 @@ def test_get_cluster_name_when_standalone(monkeypatch):
         "proxmox_inventory_extract.api_get",
         lambda *a, **kw: [{"name": "pve1", "type": "node"}],
     )
-    from proxmox_inventory_extract import get_cluster_name
     assert get_cluster_name("h", "t", "c", True) == "standalone"
 
 
@@ -116,7 +128,6 @@ def test_get_nodes_extracts_names(monkeypatch):
         "proxmox_inventory_extract.api_get",
         lambda *a, **kw: [{"node": "pve1"}, {"node": "pve2"}],
     )
-    from proxmox_inventory_extract import get_nodes
     assert get_nodes("h", "t", "c", True) == ["pve1", "pve2"]
 
 
@@ -125,12 +136,10 @@ def test_get_vms_for_node_returns_vmids(monkeypatch):
         "proxmox_inventory_extract.api_get",
         lambda *a, **kw: [{"vmid": 100}, {"vmid": 101}],
     )
-    from proxmox_inventory_extract import get_vms_for_node
     assert get_vms_for_node("h", "pve1", "t", "c", True) == [100, 101]
 
 
 def test_parse_disks_basic():
-    from proxmox_inventory_extract import parse_disks
     cfg = {
         "scsi0": "local-lvm:vm-100-disk-0,size=50G",
         "scsi1": "local-lvm:vm-100-disk-1,size=100G",
@@ -142,29 +151,25 @@ def test_parse_disks_basic():
     names_sizes = {name: size for name, size in out}
     assert names_sizes["scsi0"] == 50
     assert names_sizes["scsi1"] == 100
-    assert names_sizes["efidisk0"] == 0  # 4M rounds down to 0 GB
+    assert names_sizes["efidisk0"] == 0
     assert "ide2" not in names_sizes
     assert "net0" not in names_sizes
 
 
 def test_parse_disks_empty():
-    from proxmox_inventory_extract import parse_disks
     assert parse_disks({}) == []
 
 
 def test_parse_tags_simple():
-    from proxmox_inventory_extract import parse_tags
     assert parse_tags({"tags": "web;prod;nginx"}) == ["web", "prod", "nginx"]
 
 
 def test_parse_tags_empty():
-    from proxmox_inventory_extract import parse_tags
     assert parse_tags({}) == []
     assert parse_tags({"tags": ""}) == []
 
 
 def test_parse_tags_whitespace():
-    from proxmox_inventory_extract import parse_tags
     assert parse_tags({"tags": " web ; prod "}) == ["web", "prod"]
 
 
@@ -173,7 +178,6 @@ def test_get_vm_config_returns_dict(monkeypatch):
         "proxmox_inventory_extract.api_get",
         lambda *a, **kw: {"name": "web01", "ostype": "l26", "tags": "web;prod"},
     )
-    from proxmox_inventory_extract import get_vm_config
     cfg = get_vm_config("h", "pve1", 100, "t", "c", True)
     assert cfg["name"] == "web01"
     assert cfg["ostype"] == "l26"
@@ -181,7 +185,6 @@ def test_get_vm_config_returns_dict(monkeypatch):
 
 
 def test_extract_ips_from_guest_agent_filters_loopback_and_ipv6():
-    """Loopback (127.x) and link-local (169.254.x) are skipped; IPv6 ignored."""
     data = [
         {
             "name": "lo",
@@ -198,35 +201,30 @@ def test_extract_ips_from_guest_agent_filters_loopback_and_ipv6():
             ],
         },
     ]
-    from proxmox_inventory_extract import extract_ips_from_guest_agent
     out = extract_ips_from_guest_agent(data)
     assert out == ["172.16.0.10", "172.16.0.11"]
 
 
 def test_extract_ips_from_guest_agent_empty():
-    from proxmox_inventory_extract import extract_ips_from_guest_agent
     assert extract_ips_from_guest_agent([]) == []
     assert extract_ips_from_guest_agent(None) == []
 
 
 def test_classify_ips_routes_by_prefix():
-    from proxmox_inventory_extract import classify_ips
     ips = ["10.1.2.3", "172.16.0.1", "202.10.20.30", "8.8.8.8"]
     out = classify_ips(ips)
     assert out["backup_ip"]  == ["10.1.2.3"]
-    assert out["private_ip"] == ["172.16.0.1", "8.8.8.8"]  # 8.8.8.8 → default private
+    assert out["private_ip"] == ["172.16.0.1", "8.8.8.8"]
     assert out["public_ip"]  == ["202.10.20.30"]
 
 
 def test_extract_ips_from_tags():
-    from proxmox_inventory_extract import extract_ips_from_tags
     tags = ["web", "172.16.0.5", "10.0.0.1", "prod", "not-an-ip", "202.1.2.3"]
     out = extract_ips_from_tags(tags)
     assert out == ["172.16.0.5", "10.0.0.1", "202.1.2.3"]
 
 
 def test_extract_ips_from_tags_empty():
-    from proxmox_inventory_extract import extract_ips_from_tags
     assert extract_ips_from_tags([]) == []
 
 
@@ -243,7 +241,6 @@ def test_detect_os_from_agent(monkeypatch):
         },
     )
     cfg = {"ostype": "l26", "agent": "enabled=1"}
-    from proxmox_inventory_extract import detect_os
     out = detect_os("h", "n", 100, cfg, "t", "c", True)
     assert out["os_family"] == "linux"
     assert out["os_distribution"] == "Ubuntu 22.04 LTS"
@@ -255,14 +252,12 @@ def test_detect_os_windows_from_agent(monkeypatch):
         "proxmox_inventory_extract.api_get",
         lambda *a, **kw: {"result": {"pretty-name": "Windows Server 2019"}},
     )
-    from proxmox_inventory_extract import detect_os
     out = detect_os("h", "n", 100, {"agent": "1"}, "t", "c", True)
     assert out["os_family"] == "windows"
     assert "Windows" in (out["os_distribution"] or "")
 
 
 def test_detect_os_falls_back_to_ostype_linux():
-    from proxmox_inventory_extract import detect_os
     cfg = {"ostype": "l26"}
     out = detect_os("h", "n", 100, cfg, "t", "c", True)
     assert out["os_family"] == "linux"
@@ -271,31 +266,26 @@ def test_detect_os_falls_back_to_ostype_linux():
 
 
 def test_detect_os_falls_back_to_ostype_windows():
-    from proxmox_inventory_extract import detect_os
     cfg = {"ostype": "win10"}
     out = detect_os("h", "n", 100, cfg, "t", "c", True)
     assert out["os_family"] == "windows"
 
 
 def test_detect_os_unknown_ostype():
-    from proxmox_inventory_extract import detect_os
     cfg = {"ostype": "other"}
     out = detect_os("h", "n", 100, cfg, "t", "c", True)
     assert out["os_family"] is None
 
 
 def test_detect_os_agent_call_fails(monkeypatch):
-    """If guest agent call raises, fall back to ostype silently."""
     def boom(*a, **kw):
         raise RuntimeError("agent down")
     monkeypatch.setattr("proxmox_inventory_extract.api_get", boom)
-    from proxmox_inventory_extract import detect_os
     out = detect_os("h", "n", 100, {"ostype": "l26"}, "t", "c", True)
     assert out["os_family"] == "linux"
 
 
 def test_build_row_all_fields():
-    from proxmox_inventory_extract import build_row
     data = {
         "name": "web01",
         "node": "pve1",
@@ -327,14 +317,12 @@ def test_build_row_all_fields():
     assert row["os_version"] == "22.04"
     assert row["memory_mb"] == 4096
     assert row["cpu_cores"] == 2
-    # Empty fields should be present
     assert row["backup_enabled"] == ""
     assert row["lifecycle"] == ""
     assert row["environment"] == ""
 
 
 def test_build_row_minimal():
-    from proxmox_inventory_extract import build_row
     data = {
         "name": "vm100",
         "node": "pve1",
@@ -351,7 +339,7 @@ def test_build_row_minimal():
     }
     row = build_row(data)
     assert row["name"] == "vm100"
-    assert row["status"] == "powered_off"  # mapped from 'stopped'
+    assert row["status"] == "powered_off"
     assert row["disks"] == ""
     assert row["tags"] == ""
     assert row["private_ip"] == ""
@@ -360,3 +348,81 @@ def test_build_row_minimal():
     assert row["os_family"] == ""
     assert row["os_distribution"] == ""
     assert row["os_version"] == ""
+
+
+def test_extract_vm_full(monkeypatch):
+    def fake_api(*a, **kw):
+        path = a[1] if len(a) > 1 else ""
+        if path.endswith("/config"):
+            return {
+                "name": "web01",
+                "ostype": "l26",
+                "tags": "web;prod",
+                "scsi0": "local-lvm:vm-100-disk-0,size=50G",
+                "scsi1": "local-lvm:vm-100-disk-1,size=100G",
+                "cores": 4,
+                "memory": 4096,
+                "agent": "enabled=1",
+                "status": "running",
+            }
+        if "network-get-interfaces" in path:
+            return [{"name": "eth0", "ip-addresses": [
+                {"ip-address": "172.16.0.10", "ip-address-type": "ipv4"},
+                {"ip-address": "10.0.0.1",    "ip-address-type": "ipv4"},
+            ]}]
+        if "get-osinfo" in path:
+            return {"result": {"pretty-name": "Ubuntu 22.04 LTS", "version-id": "22.04"}}
+        return {}
+    monkeypatch.setattr("proxmox_inventory_extract.api_get", fake_api)
+    row = extract_vm("h", "pve1", 100, "t", "c", True, "mycluster")
+    assert row["name"] == "web01"
+    assert row["cluster"] == "mycluster"
+    assert row["node"] == "pve1"
+    assert row["disks"] == "scsi0:50#scsi1:100"
+    assert row["private_ip"] == "172.16.0.10"
+    assert row["backup_ip"] == "10.0.0.1"
+    assert row["os_family"] == "linux"
+    assert row["os_distribution"] == "Ubuntu 22.04 LTS"
+    assert row["status"] == "running"
+    assert row["tags"] == "web#prod"
+
+
+def test_extract_vm_no_agent_uses_tags(monkeypatch):
+    def fake_api(*a, **kw):
+        path = a[1] if len(a) > 1 else ""
+        if path.endswith("/config"):
+            return {"name": "legacy", "ostype": "l26",
+                    "tags": "172.16.0.99;web;legacy-vm",
+                    "cores": 2, "memory": 2048, "status": "running"}
+        return {}
+    monkeypatch.setattr("proxmox_inventory_extract.api_get", fake_api)
+    row = extract_vm("h", "pve1", 101, "t", "c", True, "c")
+    assert row["private_ip"] == "172.16.0.99"
+    assert row["os_family"] == "linux"
+    assert row["os_distribution"] == ""
+
+
+def test_write_csv_roundtrip(tmp_path):
+    rows = [
+        {"name": "a", "platform": "proxmox", "cluster": "c", "disks": "scsi0:50#scsi1:100"},
+        {"name": "b", "platform": "proxmox", "cluster": "c", "disks": ""},
+    ]
+    out = tmp_path / "out.csv"
+    n = write_csv(rows, str(out))
+    assert n == 2
+    with open(out) as f:
+        reader = csv.DictReader(f)
+        assert reader.fieldnames == CSV_HEADERS
+        data = list(reader)
+    assert data[0]["disks"] == "scsi0:50#scsi1:100"
+    assert data[1]["disks"] == ""
+
+
+def test_write_csv_escapes_special_chars(tmp_path):
+    rows = [{"name": 'a,vm', "platform": "proxmox", "cluster": 'c"1', "description": "line1\nline2"}]
+    out = tmp_path / "out.csv"
+    write_csv(rows, str(out))
+    with open(out) as f:
+        content = f.read()
+    assert '"a,vm"' in content
+    assert '"c""1"' in content
