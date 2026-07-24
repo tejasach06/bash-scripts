@@ -127,3 +127,54 @@ def test_get_vms_for_node_returns_vmids(monkeypatch):
     )
     from proxmox_inventory_extract import get_vms_for_node
     assert get_vms_for_node("h", "pve1", "t", "c", True) == [100, 101]
+
+
+def test_parse_disks_basic():
+    from proxmox_inventory_extract import parse_disks
+    cfg = {
+        "scsi0": "local-lvm:vm-100-disk-0,size=50G",
+        "scsi1": "local-lvm:vm-100-disk-1,size=100G",
+        "ide2": "none,media=cdrom",
+        "net0": "virtio=AA:BB:CC:DD:EE:FF",
+        "efidisk0": "local-lvm:vm-100-disk-2,efitype=4m,size=4M",
+    }
+    out = parse_disks(cfg)
+    names_sizes = {name: size for name, size in out}
+    assert names_sizes["scsi0"] == 50
+    assert names_sizes["scsi1"] == 100
+    assert names_sizes["efidisk0"] == 0  # 4M rounds down to 0 GB
+    assert "ide2" not in names_sizes
+    assert "net0" not in names_sizes
+
+
+def test_parse_disks_empty():
+    from proxmox_inventory_extract import parse_disks
+    assert parse_disks({}) == []
+
+
+def test_parse_tags_simple():
+    from proxmox_inventory_extract import parse_tags
+    assert parse_tags({"tags": "web;prod;nginx"}) == ["web", "prod", "nginx"]
+
+
+def test_parse_tags_empty():
+    from proxmox_inventory_extract import parse_tags
+    assert parse_tags({}) == []
+    assert parse_tags({"tags": ""}) == []
+
+
+def test_parse_tags_whitespace():
+    from proxmox_inventory_extract import parse_tags
+    assert parse_tags({"tags": " web ; prod "}) == ["web", "prod"]
+
+
+def test_get_vm_config_returns_dict(monkeypatch):
+    monkeypatch.setattr(
+        "proxmox_inventory_extract.api_get",
+        lambda *a, **kw: {"name": "web01", "ostype": "l26", "tags": "web;prod"},
+    )
+    from proxmox_inventory_extract import get_vm_config
+    cfg = get_vm_config("h", "pve1", 100, "t", "c", True)
+    assert cfg["name"] == "web01"
+    assert cfg["ostype"] == "l26"
+    assert cfg["tags"] == "web;prod"

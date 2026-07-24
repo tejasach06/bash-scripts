@@ -145,6 +145,45 @@ def get_vms_for_node(host, node, ticket, csrf, verify_ssl):
     return [vm["vmid"] for vm in data if "vmid" in vm]
 
 
+def parse_disks(config):
+    """Extract (name, size_gb) tuples from VM config.
+
+    Walks DISK_KEYS in order. Skips entries that look like CDROMs (no size= attr)
+    or empty values. Size is reported in GiB; sub-GiB values round down to 0.
+    """
+    out = []
+    for key in DISK_KEYS:
+        val = config.get(key)
+        if not val or val == "none":
+            continue
+        # size= attribute may appear as `size=50G`, `size=2048M`, etc.
+        m = re.search(r"size=(\d+(?:\.\d+)?)\s*([KMGT])?", val)
+        if not m:
+            continue  # CDROM, no size reported
+        size_num = float(m.group(1))
+        unit = m.group(2) or "G"
+        size_bytes = int(size_num * SIZE_UNITS[unit])
+        size_gb = size_bytes // SIZE_UNITS["G"]
+        out.append((key, int(size_gb)))
+    return out
+
+
+def parse_tags(config):
+    """Split Proxmox tags string on ';' and strip whitespace."""
+    raw = config.get("tags", "")
+    if not raw:
+        return []
+    return [t.strip() for t in raw.split(";") if t.strip()]
+
+
+def get_vm_config(host, node, vmid, ticket, csrf, verify_ssl):
+    """Fetch the full config of a single VM."""
+    return api_get(
+        host, f"/api2/json/nodes/{node}/qemu/{vmid}/config",
+        ticket, csrf, verify_ssl,
+    ) or {}
+
+
 if __name__ == "__main__":
     # Module loaded only to import constants and stubs in tests.
     pass
