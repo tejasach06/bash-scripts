@@ -178,3 +178,53 @@ def test_get_vm_config_returns_dict(monkeypatch):
     assert cfg["name"] == "web01"
     assert cfg["ostype"] == "l26"
     assert cfg["tags"] == "web;prod"
+
+
+def test_extract_ips_from_guest_agent_filters_loopback_and_ipv6():
+    """Loopback (127.x) and link-local (169.254.x) are skipped; IPv6 ignored."""
+    data = [
+        {
+            "name": "lo",
+            "ip-addresses": [
+                {"ip-address": "127.0.0.1", "ip-address-type": "ipv4"},
+            ],
+        },
+        {
+            "name": "eth0",
+            "ip-addresses": [
+                {"ip-address": "172.16.0.10", "ip-address-type": "ipv4"},
+                {"ip-address": "172.16.0.11", "ip-address-type": "ipv4"},
+                {"ip-address": "fe80::1",     "ip-address-type": "ipv6"},
+            ],
+        },
+    ]
+    from proxmox_inventory_extract import extract_ips_from_guest_agent
+    out = extract_ips_from_guest_agent(data)
+    assert out == ["172.16.0.10", "172.16.0.11"]
+
+
+def test_extract_ips_from_guest_agent_empty():
+    from proxmox_inventory_extract import extract_ips_from_guest_agent
+    assert extract_ips_from_guest_agent([]) == []
+    assert extract_ips_from_guest_agent(None) == []
+
+
+def test_classify_ips_routes_by_prefix():
+    from proxmox_inventory_extract import classify_ips
+    ips = ["10.1.2.3", "172.16.0.1", "202.10.20.30", "8.8.8.8"]
+    out = classify_ips(ips)
+    assert out["backup_ip"]  == ["10.1.2.3"]
+    assert out["private_ip"] == ["172.16.0.1", "8.8.8.8"]  # 8.8.8.8 → default private
+    assert out["public_ip"]  == ["202.10.20.30"]
+
+
+def test_extract_ips_from_tags():
+    from proxmox_inventory_extract import extract_ips_from_tags
+    tags = ["web", "172.16.0.5", "10.0.0.1", "prod", "not-an-ip", "202.1.2.3"]
+    out = extract_ips_from_tags(tags)
+    assert out == ["172.16.0.5", "10.0.0.1", "202.1.2.3"]
+
+
+def test_extract_ips_from_tags_empty():
+    from proxmox_inventory_extract import extract_ips_from_tags
+    assert extract_ips_from_tags([]) == []

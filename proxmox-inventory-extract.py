@@ -184,6 +184,59 @@ def get_vm_config(host, node, vmid, ticket, csrf, verify_ssl):
     ) or {}
 
 
+def extract_ips_from_guest_agent(iface_data):
+    """Pull IPv4 addresses out of /agent/network-get-interfaces response.
+
+    Skips loopback (127/8) and link-local (169.254/16). Ignores IPv6.
+    """
+    if not iface_data:
+        return []
+    out = []
+    for iface in iface_data:
+        for entry in iface.get("ip-addresses", []) or []:
+            if entry.get("ip-address-type") != "ipv4":
+                continue
+            ip = entry.get("ip-address", "")
+            if ip.startswith("127.") or ip.startswith("169.254."):
+                continue
+            out.append(ip)
+    return out
+
+
+def classify_ips(ips):
+    """Group IPs by their InventoryMGR column based on IP_PREFIX_MAP.
+
+    Unknown prefixes go to private_ip as a safe default.
+    """
+    buckets = {"private_ip": [], "public_ip": [], "backup_ip": []}
+    for ip in ips:
+        column = "private_ip"  # default
+        for prefix, col in IP_PREFIX_MAP.items():
+            if ip.startswith(prefix):
+                column = col
+                break
+        buckets[column].append(ip)
+    return buckets
+
+
+def extract_ips_from_tags(tags):
+    """Find IPv4-like substrings in a list of free-form tag strings."""
+    out = []
+    for tag in tags or []:
+        for m in IPV4_RE.findall(tag):
+            out.append(m)
+    return out
+
+
+def get_guest_agent_ips(host, node, vmid, ticket, csrf, verify_ssl):
+    """Call /agent/network-get-interfaces, return list of IPv4 strings, or [] on error."""
+    data = api_get(
+        host, f"/api2/json/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces",
+        ticket, csrf, verify_ssl,
+    )
+    return extract_ips_from_guest_agent(data)
+
+
 if __name__ == "__main__":
     # Module loaded only to import constants and stubs in tests.
     pass
