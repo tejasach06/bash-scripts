@@ -156,10 +156,9 @@ def parse_disks(config):
         val = config.get(key)
         if not val or val == "none":
             continue
-        # size= attribute may appear as `size=50G`, `size=2048M`, etc.
         m = re.search(r"size=(\d+(?:\.\d+)?)\s*([KMGT])?", val)
         if not m:
-            continue  # CDROM, no size reported
+            continue
         size_num = float(m.group(1))
         unit = m.group(2) or "G"
         size_bytes = int(size_num * SIZE_UNITS[unit])
@@ -210,7 +209,7 @@ def classify_ips(ips):
     """
     buckets = {"private_ip": [], "public_ip": [], "backup_ip": []}
     for ip in ips:
-        column = "private_ip"  # default
+        column = "private_ip"
         for prefix, col in IP_PREFIX_MAP.items():
             if ip.startswith(prefix):
                 column = col
@@ -235,6 +234,43 @@ def get_guest_agent_ips(host, node, vmid, ticket, csrf, verify_ssl):
         ticket, csrf, verify_ssl,
     )
     return extract_ips_from_guest_agent(data)
+
+
+def _infer_family_from_name(name):
+    """Infer linux/windows from OS pretty-name string."""
+    if not name:
+        return None
+    n = name.lower()
+    if any(kw in n for kw in ("linux", "ubuntu", "debian", "centos", "rhel", "fedora", "suse", "alpine")):
+        return "linux"
+    if any(kw in n for kw in ("windows", "win ")):
+        return "windows"
+    return None
+
+
+def detect_os(host, node, vmid, config, ticket, csrf, verify_ssl):
+    """Detect OS info via guest agent, fall back to VM config ostype.
+
+    Returns dict with keys: os_family, os_distribution, os_version.
+    """
+    agent_enabled = config.get("agent", "")
+    if agent_enabled and agent_enabled not in ("0", "none", ""):
+        try:
+            data = api_get(
+                host, f"/api2/json/nodes/{node}/qemu/{vmid}/agent/get-osinfo",
+                ticket, csrf, verify_ssl,
+            )
+            result = data.get("result", {}) if isinstance(data, dict) else {}
+            distro = result.get("pretty-name") or result.get("name")
+            version = result.get("version") or result.get("version-id")
+            family = _infer_family_from_name(distro)
+            return {"os_family": family, "os_distribution": distro, "os_version": version}
+        except Exception:
+            pass
+
+    ostype = config.get("ostype", "")
+    family = OSTYPE_FAMILY.get(ostype)
+    return {"os_family": family, "os_distribution": None, "os_version": None}
 
 
 if __name__ == "__main__":

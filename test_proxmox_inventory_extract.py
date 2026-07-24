@@ -228,3 +228,67 @@ def test_extract_ips_from_tags():
 def test_extract_ips_from_tags_empty():
     from proxmox_inventory_extract import extract_ips_from_tags
     assert extract_ips_from_tags([]) == []
+
+
+def test_detect_os_from_agent(monkeypatch):
+    monkeypatch.setattr(
+        "proxmox_inventory_extract.api_get",
+        lambda *a, **kw: {
+            "result": {
+                "name": "Ubuntu 22.04 LTS",
+                "version": "22.04",
+                "version-id": "22.04 (Jammy Jellyfish)",
+                "pretty-name": "Ubuntu 22.04 LTS",
+            }
+        },
+    )
+    cfg = {"ostype": "l26", "agent": "enabled=1"}
+    from proxmox_inventory_extract import detect_os
+    out = detect_os("h", "n", 100, cfg, "t", "c", True)
+    assert out["os_family"] == "linux"
+    assert out["os_distribution"] == "Ubuntu 22.04 LTS"
+    assert out["os_version"] == "22.04"
+
+
+def test_detect_os_windows_from_agent(monkeypatch):
+    monkeypatch.setattr(
+        "proxmox_inventory_extract.api_get",
+        lambda *a, **kw: {"result": {"pretty-name": "Windows Server 2019"}},
+    )
+    from proxmox_inventory_extract import detect_os
+    out = detect_os("h", "n", 100, {"agent": "1"}, "t", "c", True)
+    assert out["os_family"] == "windows"
+    assert "Windows" in (out["os_distribution"] or "")
+
+
+def test_detect_os_falls_back_to_ostype_linux():
+    from proxmox_inventory_extract import detect_os
+    cfg = {"ostype": "l26"}
+    out = detect_os("h", "n", 100, cfg, "t", "c", True)
+    assert out["os_family"] == "linux"
+    assert out["os_distribution"] is None
+    assert out["os_version"] is None
+
+
+def test_detect_os_falls_back_to_ostype_windows():
+    from proxmox_inventory_extract import detect_os
+    cfg = {"ostype": "win10"}
+    out = detect_os("h", "n", 100, cfg, "t", "c", True)
+    assert out["os_family"] == "windows"
+
+
+def test_detect_os_unknown_ostype():
+    from proxmox_inventory_extract import detect_os
+    cfg = {"ostype": "other"}
+    out = detect_os("h", "n", 100, cfg, "t", "c", True)
+    assert out["os_family"] is None
+
+
+def test_detect_os_agent_call_fails(monkeypatch):
+    """If guest agent call raises, fall back to ostype silently."""
+    def boom(*a, **kw):
+        raise RuntimeError("agent down")
+    monkeypatch.setattr("proxmox_inventory_extract.api_get", boom)
+    from proxmox_inventory_extract import detect_os
+    out = detect_os("h", "n", 100, {"ostype": "l26"}, "t", "c", True)
+    assert out["os_family"] == "linux"
