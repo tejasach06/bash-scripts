@@ -292,3 +292,71 @@ def test_detect_os_agent_call_fails(monkeypatch):
     from proxmox_inventory_extract import detect_os
     out = detect_os("h", "n", 100, {"ostype": "l26"}, "t", "c", True)
     assert out["os_family"] == "linux"
+
+
+def test_build_row_all_fields():
+    from proxmox_inventory_extract import build_row
+    data = {
+        "name": "web01",
+        "node": "pve1",
+        "config": {},
+        "status": "running",
+        "os": {"os_family": "linux", "os_distribution": "Ubuntu 22.04", "os_version": "22.04"},
+        "ips_by_role": {"private_ip": ["172.16.0.10"], "public_ip": ["202.10.20.30"], "backup_ip": ["10.0.0.1"]},
+        "disks": [("scsi0", 50), ("scsi1", 100)],
+        "tags": ["web", "prod"],
+        "fqdn": "web01.example.com",
+        "cluster": "mycluster",
+        "memory_mb": 4096,
+        "cpu_cores": 2,
+    }
+    row = build_row(data)
+    assert row["name"] == "web01"
+    assert row["platform"] == "proxmox"
+    assert row["cluster"] == "mycluster"
+    assert row["node"] == "pve1"
+    assert row["disks"] == "scsi0:50#scsi1:100"
+    assert row["status"] == "running"
+    assert row["private_ip"] == "172.16.0.10"
+    assert row["public_ip"] == "202.10.20.30"
+    assert row["backup_ip"] == "10.0.0.1"
+    assert row["tags"] == "web#prod"
+    assert row["fqdn"] == "web01.example.com"
+    assert row["os_family"] == "linux"
+    assert row["os_distribution"] == "Ubuntu 22.04"
+    assert row["os_version"] == "22.04"
+    assert row["memory_mb"] == 4096
+    assert row["cpu_cores"] == 2
+    # Empty fields should be present
+    assert row["backup_enabled"] == ""
+    assert row["lifecycle"] == ""
+    assert row["environment"] == ""
+
+
+def test_build_row_minimal():
+    from proxmox_inventory_extract import build_row
+    data = {
+        "name": "vm100",
+        "node": "pve1",
+        "config": {},
+        "status": "stopped",
+        "os": {"os_family": None, "os_distribution": None, "os_version": None},
+        "ips_by_role": {"private_ip": [], "public_ip": [], "backup_ip": []},
+        "disks": [],
+        "tags": [],
+        "fqdn": "vm100",
+        "cluster": "standalone",
+        "memory_mb": 0,
+        "cpu_cores": 0,
+    }
+    row = build_row(data)
+    assert row["name"] == "vm100"
+    assert row["status"] == "powered_off"  # mapped from 'stopped'
+    assert row["disks"] == ""
+    assert row["tags"] == ""
+    assert row["private_ip"] == ""
+    assert row["public_ip"] == ""
+    assert row["backup_ip"] == ""
+    assert row["os_family"] == ""
+    assert row["os_distribution"] == ""
+    assert row["os_version"] == ""

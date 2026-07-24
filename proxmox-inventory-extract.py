@@ -273,6 +273,42 @@ def detect_os(host, node, vmid, config, ticket, csrf, verify_ssl):
     return {"os_family": family, "os_distribution": None, "os_version": None}
 
 
+def build_row(data):
+    """Assemble a single CSV row dict matching CSV_HEADERS order."""
+    name = data["name"]
+    node = data["node"]
+    config = data["config"]
+    status = data["status"]
+    os_info = data["os"]
+    ips_by_role = data["ips_by_role"]
+    disks = data["disks"]
+    tags = data["tags"]
+    fqdn = data["fqdn"]
+    cluster = data["cluster"]
+    memory_mb = data.get("memory_mb", 0)
+    cpu_cores = data.get("cpu_cores", 0)
+
+    row = {h: "" for h in CSV_HEADERS}
+
+    row["name"] = name
+    row["platform"] = "proxmox"
+    row["cluster"] = cluster
+    row["node"] = node
+    row["disks"] = MULTI_SEP.join(f"{d[0]}:{d[1]}" for d in disks)
+    row["status"] = STATUS_MAP.get(status, "unknown")
+    row["cpu_cores"] = cpu_cores
+    row["memory_mb"] = memory_mb
+    row["os_family"] = os_info.get("os_family") or ""
+    row["os_distribution"] = os_info.get("os_distribution") or ""
+    row["os_version"] = os_info.get("os_version") or ""
+    row["tags"] = MULTI_SEP.join(tags)
+    row["fqdn"] = fqdn
+    row["private_ip"] = MULTI_SEP.join(ips_by_role.get("private_ip", []))
+    row["public_ip"] = MULTI_SEP.join(ips_by_role.get("public_ip", []))
+    row["backup_ip"] = MULTI_SEP.join(ips_by_role.get("backup_ip", []))
+    return row
+
+
 if __name__ == "__main__":
     # Module loaded only to import constants and stubs in tests.
     pass
