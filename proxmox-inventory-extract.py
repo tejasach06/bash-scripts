@@ -72,6 +72,75 @@ IPV4_RE = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
 # Size suffix → bytes multiplier (Proxmox stores disk size as "50G", "100M", etc.).
 SIZE_UNITS = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
 
+# Proxmox block-storage plugin types that use LV-style naming (vm-<vmid>-disk-N).
+BLOCK_PLUGIN_TYPES = {
+    "lvm", "lvmthin", "iscsi", "iscsidirect", "zfspool", "ceph-rbd",
+}
+
+# Regex for Proxmox LV name pattern.
+LV_NAME_RE = re.compile(r"^vm-\d+-disk-\d+$")
+
+
+def split_disk_value(val):
+    """Parse a Proxmox disk config value into (storage_name, vol_name, attrs).
+
+    Example: "ssdpool:vm-100-disk-0,size=50G,format=raw"
+    Returns: ("ssdpool", "vm-100-disk-0", {"size": "50G", "format": "raw"})
+    If no colon separator separates storage:vol, returns (None, first_token, attrs).
+    """
+    if not val:
+        return None, None, {}
+    attrs = {}
+    parts = val.split(",")
+    first = parts[0]
+    for part in parts[1:]:
+        if "=" in part:
+            k, v = part.split("=", 1)
+            attrs[k] = v
+    if ":" in first:
+        storage, vol = first.split(":", 1)
+        return storage, vol, attrs
+    return None, first, attrs
+
+
+def get_storage_plugins(host, node, ticket, csrf, verify_ssl):
+    """Fetch storage plugin types for a node. Returns {storage_name: plugin_type}."""
+    data = api_get(
+        host, f"/api2/json/nodes/{node}/storage", ticket, csrf, verify_ssl
+    ) or []
+    plugins = {}
+    for entry in data:
+        name = entry.get("storage")
+        ptype = entry.get("type")
+        if name and ptype:
+            plugins[name] = ptype
+    return plugins
+
+
+def format_disk_provenance(key, storage, vol_name, plugin, size_gb):
+    """Format a single disk provenance line for the description field."""
+    return f"{key}\u2192{plugin}/{storage}/{vol_name}"
+
+
+def format_storage_tags(storage_plugins):
+    """Convert {storage: plugin} to sorted list of 'storage:<plugin>:<storage>' tags."""
+    seen = set()
+    tags = []
+    for storage, plugin in sorted(storage_plugins.items()):
+        pair = (plugin, storage)
+        if pair not in seen:
+            seen.add(pair)
+            tags.append(f"storage:{plugin}:{storage}")
+    return tags
+
+
+def is_block_plugin(plugin):
+    return plugin in BLOCK_PLUGIN_TYPES
+
+
+def is_lv_name(name):
+    return bool(LV_NAME_RE.match(name))
+
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
@@ -141,16 +210,15 @@ def get_nodes(host, ticket, csrf, verify_ssl):
 
 
 def get_vms_for_node(host, node, ticket, csrf, verify_ssl):
-    """Return list of VMIDs on a given node (QEMU only, no LXC)."""
-    data = api_get(host, f"/api2/json/nodes/{node}/qemu", ticket, csrf, verify_ssl) or []
-    return [vm["vmid"] for vm in data if "vmid" in vm]
+    """Return list of VM IDs for a specific node."""
+    data = api_get(
+        host, f"/api2/json/nodes/{node}/qemu", ticket, csrf, verify_ssl
+    ) or []
+    return [v["vmid"] for v in data if "vmid" in v]
 
 
 def get_vm_status(host, node, vmid, ticket, csrf, verify_ssl):
-    """Get VM status via Proxmox API /nodes/{node}/qemu/{vmid}/status/current.
-
-    Returns status string: 'running', 'stopped', 'paused', etc.
-    """
+    """Fetch and return the VM status string (running/stopped/paused)."""
     data = api_get(
         host, f"/api2/json/nodes/{node}/qemu/{vmid}/status/current",
         ticket, csrf, verify_ssl
@@ -158,19 +226,23 @@ def get_vm_status(host, node, vmid, ticket, csrf, verify_ssl):
     return data.get("status", "unknown")
 
 
-def parse_disks(config):
+def parse_disks(config, storage_plugins=None):
     """Extract (name, size_gb) tuples from VM config.
 
-    Walks DISK_KEYS in order. Skips entries that look like CDROMs (no size= attr)
-    or empty values. Size is reported in GiB; sub-GiB values round down to 0.
-    Output format: "name:sizeGB" joined by MULTI_SEP (semicolon for InventoryMGR).
+    Walks DISK_KEYS in order. For block storage (lvm, zfspool, iscsi, etc.),
+    emits disk_name = "<plugin>:<lv_name>" instead of the bus key. File-based
+    storage (dir, nfs, cifs) falls back to the bus key.
+
+    When storage_plugins is None (e.g. API call failed), falls back to legacy
+    key-only output.
+
+    Output format: "name:sizeGB" joined by MULTI_SEP (semicolon).
     """
     out = []
     for key in DISK_KEYS:
         val = config.get(key)
         if not val or val == "none":
             continue
-        # val format: "local-lvm:vm-100-disk-0,size=50G"
         m = re.search(r"size=(\d+(?:\.\d+)?)\s*([KMGT])?", val)
         if not m:
             continue
@@ -178,7 +250,20 @@ def parse_disks(config):
         unit = m.group(2) or "G"
         size_bytes = int(size_num * SIZE_UNITS[unit])
         size_gb = size_bytes // SIZE_UNITS["G"]
-        out.append((key, int(size_gb)))
+
+        # Determine disk name: extract storage and LV from the value string
+        storage, vol_name, _attrs = split_disk_value(val)
+        if (storage_plugins is not None
+                and storage is not None
+                and vol_name is not None
+                and is_lv_name(vol_name)
+                and is_block_plugin(storage_plugins.get(storage, ""))):
+            plugin = storage_plugins[storage]
+            name = f"{plugin}:{vol_name}"
+        else:
+            name = key  # legacy/fallback
+
+        out.append((name, int(size_gb)))
     return out
 
 
@@ -210,40 +295,37 @@ def extract_ips_from_guest_agent(iface_data):
         for entry in iface.get("ip-addresses", []) or []:
             if entry.get("ip-address-type") != "ipv4":
                 continue
-            ip = entry.get("ip-address", "")
-            if ip.startswith("127.") or ip.startswith("169.254."):
+            addr = entry.get("ip-address", "")
+            if addr.startswith("127.") or addr.startswith("169.254."):
                 continue
-            out.append(ip)
+            out.append(addr)
     return out
 
 
 def classify_ips(ips):
-    """Group IPs by their InventoryMGR column based on IP_PREFIX_MAP.
+    """Group IPs into private_ip / public_ip / backup_ip buckets.
 
-    Unknown prefixes go to private_ip as a safe default.
+    Longest prefix match wins; unmatched IPs default to private_ip.
     """
     buckets = {"private_ip": [], "public_ip": [], "backup_ip": []}
     for ip in ips:
-        column = "private_ip"
-        for prefix, col in IP_PREFIX_MAP.items():
-            if ip.startswith(prefix):
-                column = col
-                break
-        buckets[column].append(ip)
+        best = "private_ip"  # default
+        best_len = 0
+        for prefix, role in IP_PREFIX_MAP.items():
+            if ip.startswith(prefix) and len(prefix) > best_len:
+                best = role
+                best_len = len(prefix)
+        buckets[best].append(ip)
     return buckets
 
 
 def extract_ips_from_tags(tags):
-    """Find IPv4-like substrings in a list of free-form tag strings."""
-    out = []
-    for tag in tags or []:
-        for m in IPV4_RE.findall(tag):
-            out.append(m)
-    return out
+    """Scan tags for IP addresses using IPV4_RE."""
+    return list(dict.fromkeys(IPV4_RE.findall(" ".join(tags))))
 
 
 def get_guest_agent_ips(host, node, vmid, ticket, csrf, verify_ssl):
-    """Call /agent/network-get-interfaces, return list of IPv4 strings, or [] on error."""
+    """Fetch IPs from the qemu-guest-agent."""
     data = api_get(
         host, f"/api2/json/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces",
         ticket, csrf, verify_ssl,
@@ -251,46 +333,32 @@ def get_guest_agent_ips(host, node, vmid, ticket, csrf, verify_ssl):
     return extract_ips_from_guest_agent(data)
 
 
-def _infer_family_from_name(name):
-    """Infer linux/windows from OS pretty-name string."""
-    if not name:
-        return None
-    n = name.lower()
-    if any(kw in n for kw in ("linux", "ubuntu", "debian", "centos", "rhel", "fedora", "suse", "alpine")):
-        return "linux"
-    if any(kw in n for kw in ("windows", "win ")):
-        return "windows"
-    return None
-
-
 def detect_os(host, node, vmid, config, ticket, csrf, verify_ssl):
-    """Detect OS info via guest agent, fall back to VM config ostype.
-
-    Returns dict with keys: os_family, os_distribution, os_version.
-    """
-    agent_enabled = config.get("agent", "")
-    if agent_enabled and agent_enabled not in ("0", "none", ""):
+    """Detect OS family/distribution/version from guest agent, falling back to ostype."""
+    if "agent" in config:
         try:
             data = api_get(
-                host, f"/api2/json/nodes/{node}/qemu/{vmid}/agent/get-osinfo",
+                host,
+                f"/api2/json/nodes/{node}/qemu/{vmid}/agent/get-osinfo",
                 ticket, csrf, verify_ssl,
             )
-            result = data.get("result", {}) if isinstance(data, dict) else {}
-            distro = result.get("pretty-name") or result.get("name")
-            version = result.get("version") or result.get("version-id")
-            family = _infer_family_from_name(distro)
-            # Extract base distribution name
-            # e.g., "Ubuntu 22.04 LTS" -> "Ubuntu", "Windows Server 2019" -> "Windows Server"
-            distro_base = None
-            if distro:
-                parts = distro.split()
-                if family == "windows" and len(parts) >= 2 and parts[1].lower() == "server":
-                    distro_base = "Windows Server"
-                elif family == "linux" and len(parts) >= 2 and parts[1].lower() in ("linux", "gnu/linux", "server", "enterprise"):
-                    distro_base = f"{parts[0]} {parts[1]}"
+            result = data.get("result", {}) if data else {}
+            pretty = result.get("pretty-name", "")
+            if pretty:
+                family = "windows" if "windows" in pretty.lower() else "linux"
+                parts = pretty.split()
+                version = ""
+                if len(parts) >= 2:
+                    version = parts[1] if parts[1].replace(".", "").isdigit() else parts[-1]
+                    distro_base = parts[0]  # e.g. "Ubuntu", "Debian", etc.
+                    # Keep "Windows Server" as distro base
+                    if family == "windows" and len(parts) >= 2 and parts[1].lower() == "server":
+                        distro_base = "Windows Server"
+                        version = parts[-1]
                 else:
                     distro_base = parts[0]
-            return {"os_family": family, "os_distribution": distro_base, "os_version": version}
+                    version = ""
+                return {"os_family": family, "os_distribution": distro_base, "os_version": version}
         except Exception:
             pass
 
@@ -314,6 +382,8 @@ def build_row(data):
     vmid = data.get("vmid")  # Proxmox VMID; emitted as external_id per InventoryMGR schema
     memory_mb = data.get("memory_mb", 0)
     cpu_cores = data.get("cpu_cores", 0)
+    description = data.get("description", "")
+    extra_tags = data.get("extra_tags", [])
 
     row = {h: "" for h in CSV_HEADERS}
 
@@ -329,15 +399,16 @@ def build_row(data):
     row["os_family"] = os_info.get("os_family") or ""
     row["os_distribution"] = os_info.get("os_distribution") or ""
     row["os_version"] = os_info.get("os_version") or ""
-    row["tags"] = MULTI_SEP.join(tags)
+    row["tags"] = MULTI_SEP.join(tags + extra_tags)
     row["fqdn"] = fqdn
     row["private_ip"] = MULTI_SEP.join(ips_by_role.get("private_ip", []))
     row["public_ip"] = MULTI_SEP.join(ips_by_role.get("public_ip", []))
     row["backup_ip"] = MULTI_SEP.join(ips_by_role.get("backup_ip", []))
+    row["description"] = description
     return row
 
 
-def extract_vm(host, node, vmid, ticket, csrf, verify_ssl, cluster):
+def extract_vm(host, node, vmid, ticket, csrf, verify_ssl, cluster, storage_plugins=None):
     """Orchestrate per-VM data collection and return a CSV row dict."""
     config = get_vm_config(host, node, vmid, ticket, csrf, verify_ssl)
     if not config:
@@ -354,7 +425,9 @@ def extract_vm(host, node, vmid, ticket, csrf, verify_ssl, cluster):
     except (TypeError, ValueError):
         memory_mb = 0
 
-    disks = parse_disks(config)
+    disks, disk_provenance, storage_used = parse_disks_with_provenance(
+        config, storage_plugins
+    )
     tags = parse_tags(config)
 
     agent_enabled = config.get("agent", "")
@@ -372,6 +445,9 @@ def extract_vm(host, node, vmid, ticket, csrf, verify_ssl, cluster):
               else {"os_family": OSTYPE_FAMILY.get(config.get("ostype", "")),
                     "os_distribution": None, "os_version": None}
 
+    extra_tags = format_storage_tags(storage_used)
+    description = MULTI_SEP.join(disk_provenance) if disk_provenance else ""
+
     return build_row({
         "name": config.get("name", f"vm-{vmid}"),
         "node": node,
@@ -386,7 +462,54 @@ def extract_vm(host, node, vmid, ticket, csrf, verify_ssl, cluster):
         "vmid": vmid,  # Proxmox VMID → CSV external_id per InventoryMGR schema
         "memory_mb": memory_mb,
         "cpu_cores": cpu_cores,
+        "description": description,
+        "extra_tags": extra_tags,
     })
+
+
+def parse_disks_with_provenance(config, storage_plugins):
+    """Parse disks like parse_disks but also return provenance lines and storage tags.
+
+    Returns (disks, provenance_lines, storage_plugins_seen) where:
+      disks: list of (name, size_gb) tuples
+      provenance_lines: list of provenance description strings
+      storage_plugins_seen: {storage_name: plugin} for unique storages used
+    """
+    out_disks = []
+    provenance = []
+    seen_plugins = {}
+
+    for key in DISK_KEYS:
+        val = config.get(key)
+        if not val or val == "none":
+            continue
+        m = re.search(r"size=(\d+(?:\.\d+)?)\s*([KMGT])?", val)
+        if not m:
+            continue
+        size_num = float(m.group(1))
+        unit = m.group(2) or "G"
+        size_bytes = int(size_num * SIZE_UNITS[unit])
+        size_gb = size_bytes // SIZE_UNITS["G"]
+
+        storage, vol_name, _attrs = split_disk_value(val)
+
+        if (storage_plugins is not None
+                and storage is not None
+                and vol_name is not None
+                and is_lv_name(vol_name)
+                and is_block_plugin(storage_plugins.get(storage, ""))):
+            plugin = storage_plugins[storage]
+            name = f"{plugin}:{vol_name}"
+            seen_plugins[storage] = plugin
+            provenance.append(
+                format_disk_provenance(key, storage, vol_name, plugin, size_gb)
+            )
+        else:
+            name = key  # legacy / file storage
+
+        out_disks.append((name, int(size_gb)))
+    
+    return out_disks, provenance, seen_plugins
 
 
 def write_csv(rows, path):
@@ -418,7 +541,7 @@ def main():
     print(f"Connecting to {args.host} as {args.user}...", file=sys.stderr)
     ticket, csrf = get_ticket(args.host, args.user, args.password, verify_ssl)
 
-    print("Fetching cluster info...", file=sys.stderr)
+    print("Fetching PLUGIN info...", file=sys.stderr)
     cluster = get_cluster_name(args.host, ticket, csrf, verify_ssl)
 
     print("Enumerating nodes...", file=sys.stderr)
@@ -428,10 +551,17 @@ def main():
     for node in nodes:
         print(f"Scanning VMs on {node}...", file=sys.stderr)
 
+        # Fetch storage plugins once per node
+        try:
+            storage_plugins = get_storage_plugins(args.host, node, ticket, csrf, verify_ssl)
+        except Exception as e:
+            print(f"  [warn] storage plugin fetch failed for {node}: {e}", file=sys.stderr)
+            storage_plugins = None
+
         vmids = get_vms_for_node(args.host, node, ticket, csrf, verify_ssl)
         for vmid in vmids:
             try:
-                row = extract_vm(args.host, node, vmid, ticket, csrf, verify_ssl, cluster)
+                row = extract_vm(args.host, node, vmid, ticket, csrf, verify_ssl, cluster, storage_plugins)
                 all_rows.append(row)
                 print(f"  VM {vmid} ({row['name']}): {row['status']}", file=sys.stderr)
             except Exception as e:
@@ -449,4 +579,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    pass

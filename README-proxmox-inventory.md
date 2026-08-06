@@ -38,16 +38,16 @@ Matches InventoryMGR's `ALL_HEADERS` exactly (34 columns). Key columns:
 | `external_id` | Proxmox VMID (per InventoryMGR schema — `external_id = vmid`) |
 | `cluster` | `/cluster/status` name or `standalone` |
 | `node` | Proxmox node name |
-| `disks` | `scsi0:50#scsi1:100` (disk_name:size_GB, `#`-joined) |
+| `disks` | `scsi0:50;scsi1:100` (disk_name:size_GB, `;`-joined) |
 | `status` | `running` / `powered_off` / `suspended` (from Proxmox status) |
 | `private_ip` | guest agent IPs starting with `172.` (or others not matching rules) |
 | `public_ip` | guest agent IPs starting with `202.` |
 | `backup_ip` | guest agent IPs starting with `10.` |
-| `tags` | Proxmox tags, `#`-joined |
+| `tags` | Proxmox tags, `;`-joined |
 | `fqdn` | VM `name` |
 | `os_family` | `linux` / `windows` / empty (from guest agent or `ostype`) |
-| `os_distribution` | guest agent `pretty-name` (e.g. "Ubuntu 22.04 LTS") |
-| `os_version` | guest agent `version-id` (e.g. "22.04") |
+| `os_distribution` | guest agent base distro name (e.g. "Ubuntu") |
+| `os_version` | guest agent version (e.g. "22.04") |
 | `cpu_cores` | VM config `cores` |
 | `memory_mb` | VM config `memory` |
 
@@ -60,7 +60,30 @@ Matches InventoryMGR's `ALL_HEADERS` exactly (34 columns). Key columns:
 | `202.*` | `public_ip` |
 | *other* | `private_ip` (safe default) |
 
-Multiple IPs per role are `#`-joined in a single cell.
+Multiple IPs per role are `;`-joined in a single cell.
+
+## Disk Names
+
+Block-storage disks (LVM, ZFS, iSCSI, Ceph RBD) get **plugin-prefixed** LV names:
+
+| Storage Plugin | Original Config | Disk Name in CSV |
+|---------------|----------------|-----------------|
+| lvm / lvmthin | `ssdpool:vm-100-disk-0,size=50G` | `lvm:vm-100-disk-0:50` |
+| zfspool | `zfspool:vm-100-disk-1,size=100G` | `zfspool:vm-100-disk-1:100` |
+| iscsi / iscsidirect | `iscsi-data:vm-100-disk-0,size=200G` | `iscsi:vm-100-disk-0:200` |
+| ceph-rbd | `ceph:vm-100-disk-0,size=50G` | `ceph-rbd:vm-100-disk-0:50` |
+| file (dir/nfs/cifs) | `local:100/vm-100-disk-2.raw,size=10G` | `scsi0:10` (bus-key fallback) |
+
+The script discovers plugin types via `/nodes/{node}/storage` (one API call
+per node). If the storage API is unreachable, all disks fall back to bus keys.
+
+## Description and Tags
+
+The `description` column carries `;`-joined disk provenance lines:
+`scsi0→lvm/ssdpool/vm-100-disk-0;scsi1→lvm/ssdpool/vm-100-disk-1`
+
+The `tags` column includes `;`-joined storage entries such as:
+`tags_from_vm;storage:lvm:ssdpool;storage:zfspool:zfspool`
 
 ## Data Sources (Priority)
 
@@ -76,9 +99,3 @@ Multiple IPs per role are `#`-joined in a single cell.
 # /etc/cron.d/proxmox-inventory
 0 2 * * * root PVE_PASSWORD="***" /path/to/proxmox-inventory-extract.py --insecure -o /backups/inventory-$(date +\%F).csv
 ```
-
-## Requirements
-
-- Python 3.8+ (stdlib only: `urllib`, `csv`, `json`, `argparse`, `ssl`, `re`, `datetime`)
-- Runs **on a Proxmox host** (or machine with API access to port 8006)
-- Guest agent must be enabled in VM config (`agent: enabled=1`) for live IPs/OS info
