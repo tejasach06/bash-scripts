@@ -323,6 +323,7 @@ def test_build_row_all_fields():
         "tags": ["web", "prod"],
         "fqdn": "web01.example.com",
         "cluster": "mycluster",
+        "vmid": 100,  # Proxmox VMID → external_id per InventoryMGR schema
         "memory_mb": 4096,
         "cpu_cores": 2,
     }
@@ -331,6 +332,7 @@ def test_build_row_all_fields():
     assert row["platform"] == "proxmox"
     assert row["cluster"] == "mycluster"
     assert row["node"] == "pve1"
+    assert row["external_id"] == "100"  # VMID stringified
     assert row["disks"] == "scsi0:50;scsi1:100"
     assert row["status"] == "running"
     assert row["private_ip"] == "172.16.0.10"
@@ -403,6 +405,7 @@ def test_extract_vm_full(monkeypatch):
     monkeypatch.setattr("proxmox_inventory_extract.get_vm_status", lambda *a, **kw: "running")
     row = extract_vm("h", "pve1", 100, "t", "c", True, "mycluster")
     assert row["name"] == "web01"
+    assert row["external_id"] == "100"  # VMID → external_id per InventoryMGR schema
     assert row["cluster"] == "mycluster"
     assert row["node"] == "pve1"
     assert row["disks"] == "scsi0:50;scsi1:100"

@@ -25,7 +25,7 @@ CSV_HEADERS = [
     "name", "platform", "cluster",
     "backup_enabled", "backup_ip", "backup_location", "business_owner", "cpu_cores",
     "criticality", "datacenter", "decommission_date", "description", "disks",
-    "environment", "fqdn", "ha_enabled", "last_patch_date", "last_vuln_scan_date",
+    "environment", "external_id", "fqdn", "ha_enabled", "last_patch_date", "last_vuln_scan_date",
     "lifecycle", "memory_mb", "monitoring_enabled", "node", "os_distribution",
     "os_family", "os_version", "owner", "pmp_enabled", "private_ip", "public_ip",
     "security_remarks", "status", "tags", "technical_owner",
@@ -311,6 +311,7 @@ def build_row(data):
     tags = data["tags"]
     fqdn = data["fqdn"]
     cluster = data["cluster"]
+    vmid = data.get("vmid")  # Proxmox VMID; emitted as external_id per InventoryMGR schema
     memory_mb = data.get("memory_mb", 0)
     cpu_cores = data.get("cpu_cores", 0)
 
@@ -320,6 +321,7 @@ def build_row(data):
     row["platform"] = "proxmox"
     row["cluster"] = cluster
     row["node"] = node
+    row["external_id"] = str(vmid) if vmid is not None else ""
     row["disks"] = MULTI_SEP.join(f"{d[0]}:{d[1]}" for d in disks)
     row["status"] = STATUS_MAP.get(status, "unknown")
     row["cpu_cores"] = cpu_cores
@@ -381,6 +383,7 @@ def extract_vm(host, node, vmid, ticket, csrf, verify_ssl, cluster):
         "tags": tags,
         "fqdn": config.get("name", f"vm-{vmid}"),
         "cluster": cluster,
+        "vmid": vmid,  # Proxmox VMID → CSV external_id per InventoryMGR schema
         "memory_mb": memory_mb,
         "cpu_cores": cpu_cores,
     })
