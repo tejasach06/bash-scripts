@@ -29,6 +29,10 @@ from proxmox_inventory_extract import (
     IP_PREFIX_MAP,
     CSV_HEADERS,
     MULTI_SEP,
+    format_storage_tags,
+    format_disk_provenance,
+    split_disk_value,
+    get_storage_plugins,
 )
 
 
@@ -157,6 +161,80 @@ def test_parse_disks_basic():
 
 def test_parse_disks_empty():
     assert parse_disks({}) == []
+
+
+
+def test_parse_disks_lvm_block():
+    cfg = {
+        "scsi0": "ssdpool:vm-100-disk-0,size=50G",
+        "scsi1": "ssdpool:vm-100-disk-1,size=100G",
+        "ide2": "none,media=cdrom",
+    }
+    storage_plugins = {"ssdpool": "lvm"}
+    out = parse_disks(cfg, storage_plugins=storage_plugins)
+    assert out == [("lvm:vm-100-disk-0", 50), ("lvm:vm-100-disk-1", 100)]
+    names = [d[0] for d in out]
+    assert "ide2" not in names
+
+
+def test_parse_disks_zfspool_block():
+    cfg = {
+        "scsi0": "zfspool:vm-100-disk-0,size=100G",
+    }
+    storage_plugins = {"zfspool": "zfspool"}
+    out = parse_disks(cfg, storage_plugins=storage_plugins)
+    assert out == [("zfspool:vm-100-disk-0", 100)]
+
+
+def test_parse_disks_no_lv_name():
+    cfg = {
+        "scsi0": "local:100/vm-100-disk-2.raw,size=10G",
+    }
+    storage_plugins = {"local": "dir"}
+    out = parse_disks(cfg, storage_plugins=storage_plugins)
+    assert out == [("scsi0", 10)]
+
+
+def test_parse_disks_no_storage_cache():
+    cfg = {
+        "scsi0": "ssdpool:vm-100-disk-0,size=50G",
+    }
+    out = parse_disks(cfg, storage_plugins=None)
+    assert out == [("scsi0", 50)]
+
+
+def test_split_disk_value():
+    storage, vol, attrs = split_disk_value("ssdpool:vm-100-disk-0,size=50G,format=raw")
+    assert storage == "ssdpool"
+    assert vol == "vm-100-disk-0"
+    assert attrs["size"] == "50G"
+    assert attrs["format"] == "raw"
+    cfg2, vol2, attrs2 = split_disk_value("local:100/vm-100-disk-2.raw,size=10G")
+    assert cfg2 == "local"
+    assert vol2 == "100/vm-100-disk-2.raw"
+    assert attrs2["size"] == "10G"
+    cfg3, vol3, attrs3 = split_disk_value("ssdpool:vm-100-disk-0,format=raw")
+    assert attrs3.get("size") is None
+
+
+def test_format_storage_tags():
+    assert format_storage_tags({"ssdpool": "lvm"}) == ["storage:lvm:ssdpool"]
+    assert format_storage_tags({"ssdpool": "lvm", "backuppool": "lvm"}) == [
+        "storage:lvm:backuppool",
+        "storage:lvm:ssdpool",
+    ]
+    assert format_storage_tags({"ssdpool": "lvm", "ssdpool": "lvm"}) == ["storage:lvm:ssdpool"]
+    assert format_storage_tags({"ssdpool": "lvm", "zfspool": "zfspool"}) == [
+        "storage:lvm:ssdpool",
+        "storage:zfspool:zfspool",
+    ]
+
+
+def test_format_disk_provenance():
+    assert format_disk_provenance("scsi0", "ssdpool", "vm-100-disk-0", "lvm", 50) == \
+        "scsi0\u2192lvm/ssdpool/vm-100-disk-0"
+    assert format_disk_provenance("scsi1", "backuppool", "vm-100-disk-1", "lvm", 100) == \
+        "scsi1\u2192lvm/backuppool/vm-100-disk-1"
 
 
 def test_parse_tags_simple():
@@ -403,7 +481,7 @@ def test_extract_vm_full(monkeypatch):
         return {}
     monkeypatch.setattr("proxmox_inventory_extract.api_get", fake_api)
     monkeypatch.setattr("proxmox_inventory_extract.get_vm_status", lambda *a, **kw: "running")
-    row = extract_vm("h", "pve1", 100, "t", "c", True, "mycluster")
+    row = extract_vm("h", "pve1", 100, "t", "c", True, "mycluster", None)
     assert row["name"] == "web01"
     assert row["external_id"] == "100"  # VMID → external_id per InventoryMGR schema
     assert row["cluster"] == "mycluster"
@@ -427,7 +505,7 @@ def test_extract_vm_no_agent_uses_tags(monkeypatch):
         return {}
     monkeypatch.setattr("proxmox_inventory_extract.api_get", fake_api)
     monkeypatch.setattr("proxmox_inventory_extract.get_vm_status", lambda *a, **kw: "running")
-    row = extract_vm("h", "pve1", 101, "t", "c", True, "c")
+    row = extract_vm("h", "pve1", 101, "t", "c", True, "c", None)
     assert row["private_ip"] == "172.16.0.99"
     assert row["os_family"] == "linux"
     assert row["os_distribution"] == ""
