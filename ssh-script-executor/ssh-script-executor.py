@@ -25,6 +25,8 @@ import argparse
 import csv
 import json
 import os
+import shlex
+import shutil
 import signal
 import sys
 import subprocess
@@ -35,6 +37,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Queue
+from typing import Optional, List
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -95,6 +99,8 @@ class HostConfig:
     key_file: str = ""
     timeout: int = 30
     control_master: bool = True
+    passwords: list[str] = field(default_factory=list)  # List of passwords to try (fallback)
+    password_file: str = ""  # Path to file with passwords (one per line)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -166,10 +172,11 @@ class SSHConnection:
         self.socket_path = os.path.join(self._socket_dir.name, f"cm-{host_key}.sock")
         return self.socket_path
 
-    def _build_ssh_base_cmd(self) -> list[str]:
+    def _build_ssh_base_cmd(self, for_password: bool = False) -> list[str]:
         """Build base SSH command with common options."""
         cmd = ["ssh"]
-        cmd.extend(["-o", "BatchMode=yes"])
+        if not for_password:
+            cmd.extend(["-o", "BatchMode=yes"])
         cmd.extend(["-o", "StrictHostKeyChecking=no"])
         cmd.extend(["-o", "UserKnownHostsFile=/dev/null"])
         cmd.extend(["-o", "ConnectTimeout=10"])
@@ -179,7 +186,7 @@ class SSHConnection:
         if self.config.port != 22:
             cmd.extend(["-p", str(self.config.port)])
 
-        if self.config.key_file:
+        if self.config.key_file and not for_password:
             cmd.extend(["-i", os.path.expanduser(self.config.key_file)])
 
         if self.config.user:
@@ -187,7 +194,7 @@ class SSHConnection:
         else:
             target = self.config.host
 
-        if self.config.control_master:
+        if self.config.control_master and not for_password:
             socket_path = self._get_socket_path()
             cmd.extend(["-o", f"ControlPath={socket_path}"])
             cmd.extend(["-o", "ControlMaster=auto"])
@@ -196,31 +203,139 @@ class SSHConnection:
         cmd.append(target)
         return cmd
 
-    def start_master(self) -> bool:
-        """Start SSH master connection for reuse."""
+    def _try_key_auth(self) -> bool:
+        """Try SSH key authentication (ControlMaster)."""
         if not self.config.control_master:
-            return True
+            return False
 
         cmd = self._build_ssh_base_cmd()
         cmd.extend(["-N", "-f"])  # Background, no command
 
         try:
-            Log.debug(f"Starting SSH master: {' '.join(cmd)}")
+            Log.debug(f"Starting SSH master (key auth): {' '.join(cmd)}")
             result = subprocess.run(cmd, capture_output=True, timeout=self.config.timeout)
             if result.returncode == 0:
-                # Verify socket exists
                 time.sleep(0.3)
                 if os.path.exists(self._get_socket_path()):
-                    Log.debug(f"SSH master started for {self.config.host}")
+                    Log.debug(f"SSH master started for {self.config.host} (key auth)")
                     return True
-            Log.debug(f"SSH master start failed: {result.stderr.decode() if result.stderr else 'unknown'}")
+            Log.debug(f"SSH key auth failed: {result.stderr.decode() if result.stderr else 'unknown'}")
             return False
         except subprocess.TimeoutExpired:
-            Log.error(f"SSH master connection timeout for {self.config.host}")
+            Log.error(f"SSH key auth timeout for {self.config.host}")
             return False
         except Exception as e:
-            Log.error(f"SSH master error for {self.config.host}: {e}")
+            Log.error(f"SSH key auth error for {self.config.host}: {e}")
             return False
+
+    def _try_password_auth(self, password: str) -> tuple[bool, Optional[str]]:
+        """Try password authentication using pexpect. Returns (success, error_message)."""
+        try:
+            import pexpect
+        except ImportError:
+            return False, "pexpect not installed (pip install pexpect)"
+
+        cmd = self._build_ssh_base_cmd(for_password=True)
+        cmd.extend(["-o", "PreferredAuthentications=password", "-o", "PubkeyAuthentication=no"])
+        
+        # Build the remote command - simple test
+        remote_cmd = "echo 'SSH_PASSWORD_AUTH_OK'"
+        cmd.append(remote_cmd)
+
+        Log.debug(f"Trying password auth for {self.config.host}...")
+        try:
+            child = pexpect.spawn(cmd[0], cmd[1:], timeout=20, encoding='utf-8')
+            child.logfile_read = None  # Don't log passwords
+            
+            # Wait for password prompt
+            index = child.expect([
+                r'password:',
+                r'Password:',
+                pexpect.TIMEOUT,
+                pexpect.EOF,
+            ], timeout=15)
+            
+            if index == 0 or index == 1:
+                Log.debug(f"Password prompt received, sending password...")
+                child.sendline(password)
+                
+                # Wait for either success or another password prompt (failure)
+                index2 = child.expect([
+                    r'SSH_PASSWORD_AUTH_OK',
+                    r'password:',
+                    r'Password:',
+                    pexpect.TIMEOUT,
+                    pexpect.EOF,
+                ], timeout=15)
+                
+                if index2 == 0:
+                    Log.debug(f"Password auth succeeded for {self.config.host}")
+                    return True, None
+                elif index2 == 1 or index2 == 2:
+                    return False, "Authentication failed (wrong password)"
+                elif index2 == 3:
+                    return False, "Connection timeout after password"
+                else:
+                    return False, "Connection closed unexpectedly"
+            elif index == 2:
+                return False, "Connection timeout waiting for password prompt"
+            else:
+                return False, "Connection closed unexpectedly"
+                
+        except Exception as e:
+            return False, str(e)
+
+    def _find_working_password(self) -> Optional[str]:
+        """Try all configured passwords, return the one that works."""
+        passwords = list(self.config.passwords)
+        
+        # Add passwords from file if specified
+        if self.config.password_file:
+            try:
+                with open(os.path.expanduser(self.config.password_file)) as f:
+                    file_passwords = [line.strip() for line in f if line.strip()]
+                    passwords.extend(file_passwords)
+            except Exception as e:
+                Log.error(f"Failed to read password file {self.config.password_file}: {e}")
+        
+        if not passwords:
+            return None
+            
+        Log.info(f"Trying {len(passwords)} password(s) for {self.config.host}...")
+        
+        for i, pwd in enumerate(passwords, 1):
+            Log.debug(f"Trying password #{i}...")
+            success, error = self._try_password_auth(pwd)
+            if success:
+                Log.ok(f"Password #{i} worked for {self.config.host}")
+                return pwd
+            else:
+                Log.debug(f"Password #{i} failed: {error}")
+        
+        Log.error(f"All {len(passwords)} passwords failed for {self.config.host}")
+        return None
+
+    def start_master(self) -> bool:
+        """Start SSH master connection for reuse. Tries key auth first, then password."""
+        if not self.config.control_master:
+            return True
+
+        # Try key-based auth first
+        if self._try_key_auth():
+            return True
+
+        # Fall back to password auth if passwords configured
+        if self.config.passwords or self.config.password_file:
+            Log.info(f"Key auth failed for {self.config.host}, trying password auth...")
+            working_pwd = self._find_working_password()
+            if working_pwd:
+                # For password auth, we can't use ControlMaster easily
+                # Fall back to per-command password auth
+                Log.warn(f"Password auth works but ControlMaster not supported with password; using per-command auth")
+                self.config.control_master = False
+                return True
+        
+        return False
 
     def execute(self, script_content: str, script_args: list[str], stdin_data: str = "",
                 timeout: int = 300, dry_run: bool = False) -> HostResult:
@@ -240,14 +355,50 @@ class SSHConnection:
             )
 
         # Build remote command: cat script | bash -s -- args...
-        # We use bash -s to accept script from stdin and pass args
         remote_cmd = f"bash -s -- {' '.join(shlex.quote(a) for a in script_args)}"
 
+        # Determine auth method
+        if self.config.control_master and self.socket_path and os.path.exists(self.socket_path):
+            # Use existing ControlMaster connection
+            cmd = self._build_ssh_base_cmd()
+            cmd.append(remote_cmd)
+            return self._execute_with_cmd(cmd, script_content, stdin_data, timeout, start_time, host)
+        
+        # Try key auth without ControlMaster
+        if self.config.key_file:
+            cmd = self._build_ssh_base_cmd()
+            cmd.append(remote_cmd)
+            result = self._execute_with_cmd(cmd, script_content, stdin_data, timeout, start_time, host)
+            if result.success:
+                return result
+            Log.debug(f"Key auth execution failed: {result.error or 'non-zero exit'}")
+
+        # Fall back to password auth
+        if self.config.passwords or self.config.password_file:
+            working_pwd = self._find_working_password()
+            if working_pwd:
+                return self._execute_with_password(working_pwd, remote_cmd, script_content, stdin_data, timeout, start_time, host)
+            else:
+                return HostResult(
+                    host=host,
+                    success=False,
+                    exit_code=-1,
+                    stdout="",
+                    stderr="",
+                    duration_sec=time.time() - start_time,
+                    error="All authentication methods failed (key + passwords)",
+                )
+
+        # Last resort: try without any explicit auth (agent, etc.)
         cmd = self._build_ssh_base_cmd()
         cmd.append(remote_cmd)
+        return self._execute_with_cmd(cmd, script_content, stdin_data, timeout, start_time, host)
 
-        Log.debug(f"Executing on {host}: {' '.join(cmd[:3])}... (script + {len(script_args)} args)")
-
+    def _execute_with_cmd(self, cmd: list[str], script_content: str, stdin_data: str, 
+                          timeout: int, start_time: float, host: str) -> HostResult:
+        """Execute command with given SSH command."""
+        Log.debug(f"Executing on {host}: {' '.join(cmd[:3])}... (script + args)")
+        
         try:
             proc = subprocess.run(
                 cmd,
@@ -277,6 +428,150 @@ class SSHConnection:
                 duration_sec=duration,
                 error=f"Timeout after {timeout}s",
             )
+        except Exception as e:
+            duration = time.time() - start_time
+            return HostResult(
+                host=host,
+                success=False,
+                exit_code=-1,
+                stdout="",
+                stderr="",
+                duration_sec=duration,
+                error=str(e),
+            )
+
+    def _execute_with_password(self, password: str, remote_cmd: str, script_content: str, 
+                               stdin_data: str, timeout: int, start_time: float, host: str) -> HostResult:
+        """Execute script using password authentication via sshpass (preferred) or pexpect."""
+        
+        # Build base SSH command for password auth
+        cmd = self._build_ssh_base_cmd(for_password=True)
+        cmd.append(remote_cmd)
+        
+        # Try sshpass first (handles TTY properly)
+        if shutil.which("sshpass"):
+            return self._execute_with_sshpass(password, cmd, script_content, stdin_data, timeout, start_time, host)
+        
+        # Fall back to pexpect with PTY
+        return self._execute_with_pexpect_pty(password, cmd, script_content, stdin_data, timeout, start_time, host)
+
+    def _execute_with_sshpass(self, password: str, cmd: list[str], script_content: str,
+                              stdin_data: str, timeout: int, start_time: float, host: str) -> HostResult:
+        """Execute using sshpass for password authentication."""
+        Log.debug(f"Executing with sshpass on {host}...")
+        
+        # Prepare input data
+        input_data = script_content.encode() + (b"\n" + stdin_data.encode() if stdin_data else b"")
+        
+        sshpass_cmd = ["sshpass", "-p", password] + cmd
+        
+        try:
+            proc = subprocess.run(
+                sshpass_cmd,
+                input=input_data,
+                capture_output=True,
+                timeout=timeout,
+            )
+            duration = time.time() - start_time
+            
+            return HostResult(
+                host=host,
+                success=proc.returncode == 0,
+                exit_code=proc.returncode,
+                stdout=proc.stdout.decode(errors="replace"),
+                stderr=proc.stderr.decode(errors="replace"),
+                duration_sec=duration,
+            )
+        except subprocess.TimeoutExpired:
+            duration = time.time() - start_time
+            return HostResult(
+                host=host,
+                success=False,
+                exit_code=-1,
+                stdout="",
+                stderr="",
+                duration_sec=duration,
+                error=f"Timeout after {timeout}s",
+            )
+        except Exception as e:
+            duration = time.time() - start_time
+            return HostResult(
+                host=host,
+                success=False,
+                exit_code=-1,
+                stdout="",
+                stderr="",
+                duration_sec=duration,
+                error=str(e),
+            )
+
+    def _execute_with_pexpect_pty(self, password: str, cmd: list[str], script_content: str,
+                                  stdin_data: str, timeout: int, start_time: float, host: str) -> HostResult:
+        """Execute using pexpect with PTY allocation."""
+        try:
+            import pexpect
+        except ImportError:
+            return HostResult(
+                host=host,
+                success=False,
+                exit_code=-1,
+                stdout="",
+                stderr="",
+                duration_sec=time.time() - start_time,
+                error="pexpect not installed",
+            )
+        
+        Log.debug(f"Executing with pexpect PTY on {host}...")
+        
+        try:
+            # Use pexpect.spawn which allocates a PTY by default
+            child = pexpect.spawn(cmd[0], cmd[1:], timeout=timeout, encoding='utf-8')
+            child.logfile_read = None
+            
+            # Wait for password prompt
+            index = child.expect([
+                r'password:',
+                r'Password:',
+                pexpect.TIMEOUT,
+                pexpect.EOF,
+            ], timeout=15)
+            
+            if index == 0 or index == 1:
+                child.sendline(password)
+                
+                # Send script content via stdin
+                child.send(script_content)
+                if stdin_data:
+                    child.send(stdin_data)
+                child.sendeof()
+                
+                # Wait for completion
+                child.expect(pexpect.EOF)
+                output = child.before
+                exit_code = child.wait()
+                
+                duration = time.time() - start_time
+                return HostResult(
+                    host=host,
+                    success=exit_code == 0,
+                    exit_code=exit_code if exit_code is not None else -1,
+                    stdout=output,
+                    stderr="",
+                    duration_sec=duration,
+                )
+            else:
+                duration = time.time() - start_time
+                error = "Timeout waiting for password prompt" if index == 2 else "Connection closed"
+                return HostResult(
+                    host=host,
+                    success=False,
+                    exit_code=-1,
+                    stdout="",
+                    stderr="",
+                    duration_sec=duration,
+                    error=error,
+                )
+                
         except Exception as e:
             duration = time.time() - start_time
             return HostResult(
@@ -668,8 +963,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Execute local scripts on remote hosts via SSH",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""Examples:
-  # Single host, script with args
+  # Single host, script with args (key auth)
   {SCRIPT_NAME} --host user@server --script ./deploy.sh --args "prod us-east"
+
+  # Single host with password auth (tries key first, falls back to password)
+  {SCRIPT_NAME} --host user@server --script ./deploy.sh --password "mypassword"
+
+  # Multiple passwords as fallback (tries in order)
+  {SCRIPT_NAME} --host user@server --script ./deploy.sh --password "pass1" --password "pass2"
+
+  # Password from file (one per line)
+  {SCRIPT_NAME} --host user@server --script ./deploy.sh --password-file passwords.txt
 
   # Multiple hosts from file, parallel execution
   {SCRIPT_NAME} --host-file hosts.txt --script ./setup.sh --parallel 4
@@ -687,10 +991,12 @@ Host file format (one per line):
   user@host:port [key_file]
   host.example.com
   user@192.168.1.10 ~/.ssh/id_ed25519
-""",
-    )
 
-    # Host selection (mutually exclusive, not required for selftest)
+Password file format (one per line):
+  password1
+  password2
+  password3""",
+    )
     host_group = p.add_mutually_exclusive_group(required=False)
     host_group.add_argument("--host", help="Single host: [user@]host[:port] [key_file]")
     host_group.add_argument("--host-file", help="File with hosts (one per line)")
@@ -705,6 +1011,11 @@ Host file format (one per line):
     p.add_argument("--timeout", "-t", type=int, default=300, help="Command timeout in seconds (default: 300)")
     p.add_argument("--no-reuse", action="store_true", help="Disable SSH ControlMaster connection reuse")
     p.add_argument("--dry-run", action="store_true", help="Show what would be executed without running")
+
+    # Password authentication (fallback if key auth fails)
+    p.add_argument("--password", action="append", dest="passwords", default=[], 
+                   help="SSH password to try (can specify multiple for fallback)")
+    p.add_argument("--password-file", help="File with passwords (one per line) to try")
 
     # Output
     p.add_argument("--csv", help="Write CSV report to file")
@@ -753,6 +1064,11 @@ def main() -> int:
         hosts = parse_host_file(args.host_file)
     else:
         hosts = [parse_host_string(args.host)]
+
+    # Add password configuration to all hosts
+    for host in hosts:
+        host.passwords = args.passwords
+        host.password_file = args.password_file
 
     if not hosts:
         Log.fatal("No valid hosts specified")
