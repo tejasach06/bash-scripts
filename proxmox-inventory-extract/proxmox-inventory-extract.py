@@ -9,6 +9,7 @@ Runs directly on a Proxmox host; authenticates as root@pam via the ticket API.
 """
 import argparse
 import csv
+import dataclasses
 import datetime
 import json
 import os
@@ -17,19 +18,18 @@ import ssl
 import sys
 import urllib.parse
 import urllib.request
+from typing import Any, Optional
 
-
-# CSV column order: required first, then the rest from InventoryMGR's ALL_HEADERS.
-# This must match `app/services/csv_import.py` exactly or import will fail.
-CSV_HEADERS = [
-    "name", "platform", "cluster",
-    "backup_enabled", "backup_ip", "backup_location", "business_owner", "cpu_cores",
-    "criticality", "datacenter", "decommission_date", "description", "disks",
-    "environment", "external_id", "fqdn", "ha_enabled", "last_patch_date", "last_vuln_scan_date",
-    "lifecycle", "memory_mb", "monitoring_enabled", "node", "os_distribution",
-    "os_family", "os_version", "owner", "pmp_enabled", "private_ip", "public_ip",
-    "security_remarks", "status", "tags", "technical_owner",
-]
+# InventoryMGR TEMPLATE_COLUMNS from origin/main (ea6f8b6) - exact order required
+TEMPLATE_COLUMNS = (
+    "name", "external_id", "fqdn", "sr_id", "platform", "datacenter", "cluster", "node",
+    "status", "environment", "criticality", "vm_type", "cpu_cores", "memory_mb", "disks",
+    "storage_name", "storage_type", "os_family", "os_distribution", "os_version",
+    "private_ip", "public_ip", "backup_ip", "owner", "business_owner", "technical_owner",
+    "applications", "monitoring_enabled", "pmp_enabled", "ha_enabled", "backup_enabled",
+    "backup_location", "tags", "last_patch_date", "last_vuln_scan_date", "last_verified_at",
+    "decommission_date", "security_remarks", "description",
+)
 
 # IP prefix → InventoryMGR column name. Longest match wins.
 IP_PREFIX_MAP = {
@@ -38,544 +38,524 @@ IP_PREFIX_MAP = {
     "202.": "public_ip",
 }
 
-# VM config keys that represent virtual disks.
-DISK_KEYS = (
-    "efidisk0", "tpmstate0",
-    *[f"scsi{i}" for i in range(31)],
-    *[f"virtio{i}" for i in range(31)],
-    *[f"ide{i}" for i in range(5)],
-    *[f"sata{i}" for i in range(6)],
-)
-
 # Proxmox ostype values that map to OS family.
 OSTYPE_FAMILY = {
     "l24": "linux", "l26": "linux",
-    "wxp": "windows", "w2k": "windows", "w2k3": "windows", "w2k8": "windows",
-    "wvista": "windows", "win7": "windows", "win8": "windows",
-    "win10": "windows", "win11": "windows",
+    "wxp": "windows", "w2k": "windows", "w2k3": "windows",
+    "w2k8": "windows", "wvista": "windows", "w7": "windows",
+    "w8": "windows", "w10": "windows", "w11": "windows",
+    "w2008": "windows", "w2012": "windows", "w2016": "windows",
+    "w2019": "windows", "w2022": "windows",
+    "solaris": "solaris", "openbsd": "bsd", "freebsd": "bsd", "netbsd": "bsd",
 }
 
-# Proxmox status → InventoryMGR status.
+# Supported disk config keys in Proxmox VM config
+DISK_KEY_PATTERNS = (
+    "efidisk", "tpmstate",
+    "scsi", "virtio", "ide", "sata",
+)
+
+# Proxmox status → InventoryMGR status mapping
 STATUS_MAP = {
     "running": "running",
     "stopped": "powered_off",
-    "paused":  "suspended",
 }
 
-# Multi-value separator inside a single CSV cell.
-# InventoryMGR's csv_import.py _parse_disks splits on ";"
 MULTI_SEP = ";"
 
-# IPv4 regex for extracting IPs from free-form tag strings.
-IPV4_RE = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
 
-# Size suffix → bytes multiplier (Proxmox stores disk size as "50G", "100M", etc.).
-SIZE_UNITS = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+@dataclasses.dataclass
+class DiskRecord:
+    lv_name: str
+    config_key: str
+    size_gib: int
+    storage_id: str
+    storage_name: str
+    storage_type: str
 
-# Proxmox block-storage plugin types that use LV-style naming (vm-<vmid>-disk-N).
-BLOCK_PLUGIN_TYPES = {
-    "lvm", "lvmthin", "iscsi", "iscsidirect", "zfspool", "ceph-rbd",
-}
+    @property
+    def disk_name(self) -> str:
+        return f"{self.lv_name}-{self.config_key}"
 
-# Regex for Proxmox LV name pattern.
-LV_NAME_RE = re.compile(r"^vm-\d+-disk-\d+$")
-
-
-def split_disk_value(val):
-    """Parse a Proxmox disk config value into (storage_name, vol_name, attrs).
-
-    Example: "ssdpool:vm-100-disk-0,size=50G,format=raw"
-    Returns: ("ssdpool", "vm-100-disk-0", {"size": "50G", "format": "raw"})
-    If no colon separator separates storage:vol, returns (None, first_token, attrs).
-    """
-    if not val:
-        return None, None, {}
-    attrs = {}
-    parts = val.split(",")
-    first = parts[0]
-    for part in parts[1:]:
-        if "=" in part:
-            k, v = part.split("=", 1)
-            attrs[k] = v
-    if ":" in first:
-        storage, vol = first.split(":", 1)
-        return storage, vol, attrs
-    return None, first, attrs
+    def to_csv_field(self) -> str:
+        return f"{self.disk_name}:{self.size_gib}:{self.storage_name}:{self.storage_type}"
 
 
-def get_storage_plugins(host, node, ticket, csrf, verify_ssl):
-    """Fetch storage plugin types for a node. Returns {storage_name: plugin_type}."""
-    data = api_get(
-        host, f"/api2/json/nodes/{node}/storage", ticket, csrf, verify_ssl
-    ) or []
-    plugins = {}
-    for entry in data:
-        name = entry.get("storage")
-        ptype = entry.get("type")
-        if name and ptype:
-            plugins[name] = ptype
-    return plugins
+@dataclasses.dataclass
+class ProxmoxClient:
+    host: str
+    user: str
+    password: str
+    verify_ssl: bool
+    ticket: str = ""
+    csrf: str = ""
+
+    def get_ticket(self) -> None:
+        url = f"https://{self.host}/api2/json/access/ticket"
+        data = urllib.parse.urlencode({"username": self.user, "password": self.password}).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        ctx = self._ssl_context()
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            body = json.loads(resp.read().decode())
+        self.ticket = body["data"]["ticket"]
+        self.csrf = body["data"]["CSRFPreventionToken"]
+
+    def _ssl_context(self) -> ssl.SSLContext:
+        ctx = ssl.create_default_context()
+        if not self.verify_ssl:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Cookie": f"PVEAuthCookie={self.ticket}",
+            "CSRFPreventionToken": self.csrf,
+        }
+
+    def api_get(self, path: str) -> Any:
+        url = f"https://{self.host}{path}"
+        req = urllib.request.Request(url, headers=self._headers())
+        ctx = self._ssl_context()
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            body = json.loads(resp.read().decode())
+        return body.get("data", [])
+
+    def get_cluster_name(self) -> str:
+        data = self.api_get("/api2/json/cluster/status")
+        if isinstance(data, list) and data:
+            return data[0].get("name", "standalone")
+        return "standalone"
+
+    def get_nodes(self) -> list[str]:
+        data = self.api_get("/api2/json/nodes")
+        return [n["node"] for n in data if n.get("status") == "online"]
+
+    def get_vms_for_node(self, node: str) -> list[dict]:
+        return self.api_get(f"/api2/json/nodes/{node}/qemu")
+
+    def get_vm_config(self, node: str, vmid: int) -> dict:
+        return self.api_get(f"/api2/json/nodes/{node}/qemu/{vmid}/config")
+
+    def get_storage_config(self, node: str) -> list[dict]:
+        return self.api_get(f"/api2/json/nodes/{node}/storage")
+
+    def get_guest_ips(self, node: str, vmid: int) -> list[str]:
+        data = self.api_get(f"/api2/json/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces")
+        ips: list[str] = []
+        if not data:
+            return ips
+        for iface in data:
+            for entry in iface.get("ip-addresses", []) or []:
+                ip = entry.get("ip-address", "")
+                if ip and not ip.startswith("127.") and not ip.startswith("169.254.") and ":" not in ip:
+                    ips.append(ip)
+        return ips
+
+    def get_guest_os(self, node: str, vmid: int) -> dict[str, Optional[str]]:
+        data = self.api_get(f"/api2/json/nodes/{node}/qemu/{vmid}/agent/get-osinfo")
+        if not data:
+            return {"os_family": None, "os_distribution": None, "os_version": None}
+        return {
+            "os_family": (data.get("id") or "").lower() or None,
+            "os_distribution": data.get("pretty-name") or data.get("name") or None,
+            "os_version": data.get("version-id") or data.get("version") or None,
+        }
+
+    def get_guest_fqdn(self, node: str, vmid: int) -> Optional[str]:
+        data = self.api_get(f"/api2/json/nodes/{node}/qemu/{vmid}/agent/get-hostname")
+        if not data:
+            return None
+        hostname = data.get("hostname") or data.get("name") or ""
+        if hostname and "." in hostname and not hostname.startswith("localhost"):
+            return hostname
+        return None
 
 
-def format_disk_provenance(key, storage, vol_name, plugin, size_gb):
-    """Format a single disk provenance line for the description field."""
-    return f"{key}\u2192{plugin}/{storage}/{vol_name}"
-
-
-def format_storage_tags(storage_plugins):
-    """Convert {storage: plugin} to sorted list of 'storage:<plugin>:<storage>' tags."""
-    seen = set()
-    tags = []
-    for storage, plugin in sorted(storage_plugins.items()):
-        pair = (plugin, storage)
-        if pair not in seen:
-            seen.add(pair)
-            tags.append(f"storage:{plugin}:{storage}")
-    return tags
-
-
-def is_block_plugin(plugin):
-    return plugin in BLOCK_PLUGIN_TYPES
-
-
-def is_lv_name(name):
-    return bool(LV_NAME_RE.match(name))
-
-
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(
-        description="Extract Proxmox VM inventory to InventoryMGR-compatible CSV."
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Extract Proxmox VM inventory as InventoryMGR-compatible CSV",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("-o", "--output", default=None,
-                   help="Output CSV path (default: /tmp/proxmox-inventory-<ts>.csv)")
-    p.add_argument("-H", "--host", default="127.0.0.1:8006",
-                   help="Proxmox host:port (default: 127.0.0.1:8006)")
-    p.add_argument("-u", "--user", default="root@pam",
-                   help="Proxmox username@realm (default: root@pam)")
-    p.add_argument("-p", "--password", default=None,
-                   help="Password. If omitted, reads PVE_PASSWORD env var, then prompts.")
-    p.add_argument("--insecure", action="store_true",
-                   help="Disable TLS certificate verification")
-    return p.parse_args(argv)
+    parser.add_argument("-o", "--output", help="Output CSV path (default: /tmp/proxmox-inventory-<ts>.csv)")
+    parser.add_argument("-H", "--host", default="127.0.0.1:8006", help="Proxmox API endpoint")
+    parser.add_argument("-u", "--user", default="root@pam", help="Proxmox username")
+    parser.add_argument("-p", "--password", help="Password (or use PVE_PASSWORD env)")
+    parser.add_argument("--insecure", action="store_true", help="Disable TLS cert verification")
+    parser.add_argument("--version", action="version", version="proxmox-inventory-extract 2026-08-15")
+    return parser.parse_args(argv)
 
 
-def get_ticket(host, user, password, verify_ssl=True):
-    """Authenticate against /access/ticket and return (ticket, csrf_token)."""
-    url = f"https://{host}/api2/json/access/ticket"
-    data = urllib.parse.urlencode({"username": user, "password": password}).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    ctx = None if verify_ssl else ssl._create_unverified_context()
-    with urllib.request.urlopen(req, context=ctx) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
-    return body["data"]["ticket"], body["data"]["CSRFPreventionToken"]
-
-
-def api_get(host, path, ticket, csrf=None, verify_ssl=True, timeout=15):
-    """GET a Proxmox API endpoint and return the `data` field.
-
-    Returns {} on HTTP 404 (so callers can check truthiness). Re-raises on
-    other errors so the caller can decide whether to skip or fail.
-    """
-    from urllib.error import HTTPError
-    url = f"https://{host}{path}"
-    req = urllib.request.Request(url, method="GET")
-    req.add_header("Cookie", f"PVEAuthCookie={ticket}")
-    if csrf:
-        req.add_header("CSRFPreventionToken", csrf)
-    ctx = None if verify_ssl else ssl._create_unverified_context()
+def resolve_password(args: argparse.Namespace) -> str:
+    if args.password:
+        return args.password
+    if "PVE_PASSWORD" in os.environ:
+        return os.environ["PVE_PASSWORD"]
     try:
-        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-        return body.get("data", {})
-    except HTTPError as e:
-        if e.code == 404:
-            return {}
-        raise
+        import getpass
+        return getpass.getpass("Proxmox password: ")
+    except (EOFError, KeyboardInterrupt):
+        sys.exit(1)
 
 
-def get_cluster_name(host, ticket, csrf, verify_ssl):
-    """Return the Proxmox cluster name, or 'standalone' if not clustered."""
-    data = api_get(host, "/api2/json/cluster/status", ticket, csrf, verify_ssl) or []
-    for entry in data:
-        if entry.get("type") == "cluster":
-            return entry.get("name", "standalone")
-    return "standalone"
-
-
-def get_nodes(host, ticket, csrf, verify_ssl):
-    """Return list of node names from /nodes."""
-    data = api_get(host, "/api2/json/nodes", ticket, csrf, verify_ssl) or []
-    return [n["node"] for n in data if "node" in n]
-
-
-def get_vms_for_node(host, node, ticket, csrf, verify_ssl):
-    """Return list of VM IDs for a specific node."""
-    data = api_get(
-        host, f"/api2/json/nodes/{node}/qemu", ticket, csrf, verify_ssl
-    ) or []
-    return [v["vmid"] for v in data if "vmid" in v]
-
-
-def get_vm_status(host, node, vmid, ticket, csrf, verify_ssl):
-    """Fetch and return the VM status string (running/stopped/paused)."""
-    data = api_get(
-        host, f"/api2/json/nodes/{node}/qemu/{vmid}/status/current",
-        ticket, csrf, verify_ssl
-    ) or {}
-    return data.get("status", "unknown")
-
-
-def parse_disks(config, storage_plugins=None):
-    """Extract (name, size_gb) tuples from VM config.
-
-    Walks DISK_KEYS in order. For block storage (lvm, zfspool, iscsi, etc.),
-    emits disk_name = "<plugin>:<lv_name>" instead of the bus key. File-based
-    storage (dir, nfs, cifs) falls back to the bus key.
-
-    When storage_plugins is None (e.g. API call failed), falls back to legacy
-    key-only output.
-
-    Output format: "name:sizeGB" joined by MULTI_SEP (semicolon).
-    """
-    out = []
-    for key in DISK_KEYS:
-        val = config.get(key)
-        if not val or val == "none":
+def build_storage_meta(client: ProxmoxClient, node: str) -> dict[str, dict]:
+    """Fetch storage config and build metadata map keyed by storage ID."""
+    meta = {}
+    try:
+        storages = client.get_storage_config(node)
+    except Exception as e:
+        print(f"[warn] Failed to fetch storage config for {node}: {e}", file=sys.stderr)
+        return meta
+    for s in storages:
+        sid = s.get("storage")
+        if not sid:
             continue
-        m = re.search(r"size=(\d+(?:\.\d+)?)\s*([KMGT])?", val)
-        if not m:
+        meta[sid] = {
+            "storage_id": sid,
+            "type": s.get("type", ""),
+            "vgname": s.get("vgname", ""),
+        }
+    return meta
+
+
+def parse_disks(config: dict, storage_meta: dict) -> list[DiskRecord]:
+    """Parse all supported disk config keys into structured DiskRecord list."""
+    disks: list[DiskRecord] = []
+    for key, value in config.items():
+        if not any(key.startswith(p) for p in DISK_KEY_PATTERNS):
             continue
-        size_num = float(m.group(1))
-        unit = m.group(2) or "G"
-        size_bytes = int(size_num * SIZE_UNITS[unit])
-        size_gb = size_bytes // SIZE_UNITS["G"]
+        if not value or value == "none":
+            continue
+        if isinstance(value, str) and "media=cdrom" in value:
+            continue
 
-        # Determine disk name: extract storage and LV from the value string
-        storage, vol_name, _attrs = split_disk_value(val)
-        if (storage_plugins is not None
-                and storage is not None
-                and vol_name is not None
-                and is_lv_name(vol_name)
-                and is_block_plugin(storage_plugins.get(storage, ""))):
-            plugin = storage_plugins[storage]
-            name = f"{plugin}:{vol_name}"
-        else:
-            name = key  # legacy/fallback
+        lv_name, size_gib, storage_id, size_found = parse_disk_value(value)
+        if not lv_name or (size_gib == 0 and not size_found):
+            print(f"[warn] Skipping malformed disk {key}={value}", file=sys.stderr)
+            continue
 
-        out.append((name, int(size_gb)))
-    return out
+        meta = storage_meta.get(storage_id, {})
+        storage_name = meta.get("vgname") or storage_id
+        storage_type = meta.get("type", "")
+
+        disks.append(DiskRecord(
+            lv_name=lv_name,
+            config_key=key,
+            size_gib=size_gib,
+            storage_id=storage_id,
+            storage_name=storage_name,
+            storage_type=storage_type,
+        ))
+    return disks
 
 
-def parse_tags(config):
-    """Split Proxmox tags string on ';' and strip whitespace."""
+def parse_disk_value(value: str) -> tuple[str, int, str, bool]:
+    """Parse Proxmox disk config value into (lv_name, size_gib, storage_id, size_found)."""
+    if not value:
+        return "", 0, "", False
+
+    parts = value.split(",")
+    main = parts[0]
+    if ":" not in main:
+        return "", 0, "", False
+
+    storage_id, volume = main.split(":", 1)
+    lv_name = volume.split("/")[-1]
+
+    size_gib = 0
+    size_found = False
+    for part in parts[1:]:
+        part = part.strip()
+        if part.startswith("size="):
+            size_str = part[5:]
+            size_gib = parse_size_to_gib(size_str)
+            size_found = True
+            break
+
+    return lv_name, size_gib, storage_id, size_found
+
+
+def parse_size_to_gib(size_str: str) -> int:
+    """Parse Proxmox size string (e.g., '50G', '512M', '1T') to GiB."""
+    size_str = size_str.strip().upper()
+    if not size_str:
+        return 0
+    match = re.match(r"^(\d+)([KMGT]?)[B]?$", size_str)
+    if not match:
+        return 0
+    value = int(match.group(1))
+    unit = match.group(2) or "B"
+    if unit == "K":
+        return value // (1024 * 1024)
+    elif unit == "M":
+        return value // 1024
+    elif unit == "G":
+        return value
+    elif unit == "T":
+        return value * 1024
+    return 0
+
+
+def classify_ips(ips: list[str]) -> dict[str, list[str]]:
+    """Classify IPs by prefix map into InventoryMGR role columns."""
+    result = {"private_ip": [], "public_ip": [], "backup_ip": []}
+    for ip in ips:
+        matched = False
+        for prefix, column in IP_PREFIX_MAP.items():
+            if ip.startswith(prefix):
+                result[column].append(ip)
+                matched = True
+                break
+        if not matched:
+            result["private_ip"].append(ip)
+    return result
+
+
+def extract_ips_from_tags(tags: str) -> list[str]:
+    """Fallback: extract IP-like strings from Proxmox tags."""
+    if not tags:
+        return []
+    ip_pattern = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+    return ip_pattern.findall(tags)
+
+
+def parse_tags(config: dict) -> str:
+    """Extract and join Proxmox tags with semicolon."""
     raw = config.get("tags", "")
     if not raw:
-        return []
-    return [t.strip() for t in raw.split(";") if t.strip()]
+        return ""
+    return MULTI_SEP.join(t.strip() for t in raw.split(";") if t.strip())
 
 
-def get_vm_config(host, node, vmid, ticket, csrf, verify_ssl):
-    """Fetch the full config of a single VM."""
-    return api_get(
-        host, f"/api2/json/nodes/{node}/qemu/{vmid}/config",
-        ticket, csrf, verify_ssl,
-    ) or {}
+def map_status(proxmox_status: str) -> str:
+    return STATUS_MAP.get(proxmox_status, "unknown")
 
 
-def extract_ips_from_guest_agent(iface_data):
-    """Pull IPv4 addresses out of /agent/network-get-interfaces response.
-
-    Skips loopback (127/8) and link-local (169.254/16). Ignores IPv6.
-    """
-    if not iface_data:
-        return []
-    out = []
-    for iface in iface_data:
-        for entry in iface.get("ip-addresses", []) or []:
-            if entry.get("ip-address-type") != "ipv4":
-                continue
-            addr = entry.get("ip-address", "")
-            if addr.startswith("127.") or addr.startswith("169.254."):
-                continue
-            out.append(addr)
-    return out
+def map_os_family(ostype: str, guest_os_family: Optional[str]) -> Optional[str]:
+    if guest_os_family:
+        return guest_os_family
+    return OSTYPE_FAMILY.get(ostype, "linux")
 
 
-def classify_ips(ips):
-    """Group IPs into private_ip / public_ip / backup_ip buckets.
+def serialize_vm(
+    vmid: int,
+    config: dict,
+    status: str,
+    node: str,
+    cluster_name: str,
+    disks: list[DiskRecord],
+    ips_by_role: dict[str, list[str]],
+    os_info: dict[str, Optional[str]],
+    fqdn: Optional[str],
+    description: str,
+    tags: str,
+) -> dict[str, str]:
+    """Map internal VM data to InventoryMGR CSV row (all TEMPLATE_COLUMNS)."""
+    row = {col: "" for col in TEMPLATE_COLUMNS}
 
-    Longest prefix match wins; unmatched IPs default to private_ip.
-    """
-    buckets = {"private_ip": [], "public_ip": [], "backup_ip": []}
-    for ip in ips:
-        best = "private_ip"  # default
-        best_len = 0
-        for prefix, role in IP_PREFIX_MAP.items():
-            if ip.startswith(prefix) and len(prefix) > best_len:
-                best = role
-                best_len = len(prefix)
-        buckets[best].append(ip)
-    return buckets
-
-
-def extract_ips_from_tags(tags):
-    """Scan tags for IP addresses using IPV4_RE."""
-    return list(dict.fromkeys(IPV4_RE.findall(" ".join(tags))))
-
-
-def get_guest_agent_ips(host, node, vmid, ticket, csrf, verify_ssl):
-    """Fetch IPs from the qemu-guest-agent."""
-    data = api_get(
-        host, f"/api2/json/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces",
-        ticket, csrf, verify_ssl,
-    )
-    return extract_ips_from_guest_agent(data)
-
-
-def detect_os(host, node, vmid, config, ticket, csrf, verify_ssl):
-    """Detect OS family/distribution/version from guest agent, falling back to ostype."""
-    if "agent" in config:
-        try:
-            data = api_get(
-                host,
-                f"/api2/json/nodes/{node}/qemu/{vmid}/agent/get-osinfo",
-                ticket, csrf, verify_ssl,
-            )
-            result = data.get("result", {}) if data else {}
-            pretty = result.get("pretty-name", "")
-            if pretty:
-                family = "windows" if "windows" in pretty.lower() else "linux"
-                parts = pretty.split()
-                version = ""
-                if len(parts) >= 2:
-                    version = parts[1] if parts[1].replace(".", "").isdigit() else parts[-1]
-                    distro_base = parts[0]  # e.g. "Ubuntu", "Debian", etc.
-                    # Keep "Windows Server" as distro base
-                    if family == "windows" and len(parts) >= 2 and parts[1].lower() == "server":
-                        distro_base = "Windows Server"
-                        version = parts[-1]
-                else:
-                    distro_base = parts[0]
-                    version = ""
-                return {"os_family": family, "os_distribution": distro_base, "os_version": version}
-        except Exception:
-            pass
-
-    ostype = config.get("ostype", "")
-    family = OSTYPE_FAMILY.get(ostype)
-    return {"os_family": family, "os_distribution": None, "os_version": None}
-
-
-def build_row(data):
-    """Assemble a single CSV row dict matching CSV_HEADERS order."""
-    name = data["name"]
-    node = data["node"]
-    config = data["config"]
-    status = data["status"]
-    os_info = data["os"]
-    ips_by_role = data["ips_by_role"]
-    disks = data["disks"]
-    tags = data["tags"]
-    fqdn = data["fqdn"]
-    cluster = data["cluster"]
-    vmid = data.get("vmid")  # Proxmox VMID; emitted as external_id per InventoryMGR schema
-    memory_mb = data.get("memory_mb", 0)
-    cpu_cores = data.get("cpu_cores", 0)
-    description = data.get("description", "")
-    extra_tags = data.get("extra_tags", [])
-
-    row = {h: "" for h in CSV_HEADERS}
-
-    row["name"] = name
+    # Identity
+    row["name"] = config.get("name", f"vm-{vmid}")
+    row["external_id"] = str(vmid)
+    row["fqdn"] = fqdn or ""
+    row["sr_id"] = ""
     row["platform"] = "proxmox"
-    row["cluster"] = cluster
+
+    # Placement
+    row["datacenter"] = ""
+    row["cluster"] = cluster_name
     row["node"] = node
-    row["external_id"] = str(vmid) if vmid is not None else ""
-    row["disks"] = MULTI_SEP.join(f"{d[0]}:{d[1]}" for d in disks)
-    row["status"] = STATUS_MAP.get(status, "unknown")
-    row["cpu_cores"] = cpu_cores
-    row["memory_mb"] = memory_mb
-    row["os_family"] = os_info.get("os_family") or ""
+
+    # Classification
+    row["status"] = map_status(status)
+    row["environment"] = ""
+    row["criticality"] = ""
+    row["vm_type"] = ""
+
+    # Capacity
+    row["cpu_cores"] = str(config.get("cores", ""))
+    row["memory_mb"] = str(config.get("memory", ""))
+    row["disks"] = MULTI_SEP.join(d.to_csv_field() for d in disks)
+    row["storage_name"] = ""  # per-disk storage in disks column
+    row["storage_type"] = ""
+
+    # OS
+    ostype = config.get("ostype", "")
+    row["os_family"] = map_os_family(ostype, os_info.get("os_family")) or ""
     row["os_distribution"] = os_info.get("os_distribution") or ""
     row["os_version"] = os_info.get("os_version") or ""
-    row["tags"] = MULTI_SEP.join(tags + extra_tags)
-    row["fqdn"] = fqdn
-    row["private_ip"] = MULTI_SEP.join(ips_by_role.get("private_ip", []))
-    row["public_ip"] = MULTI_SEP.join(ips_by_role.get("public_ip", []))
-    row["backup_ip"] = MULTI_SEP.join(ips_by_role.get("backup_ip", []))
+
+    # Network
+    row["private_ip"] = MULTI_SEP.join(ips_by_role["private_ip"])
+    row["public_ip"] = MULTI_SEP.join(ips_by_role["public_ip"])
+    row["backup_ip"] = MULTI_SEP.join(ips_by_role["backup_ip"])
+
+    # Ownership
+    row["owner"] = ""
+    row["business_owner"] = ""
+    row["technical_owner"] = ""
+    row["applications"] = ""
+
+    # Operations
+    row["monitoring_enabled"] = ""
+    row["pmp_enabled"] = ""
+    row["ha_enabled"] = ""
+    row["backup_enabled"] = ""
+    row["backup_location"] = ""
+    row["tags"] = tags
+
+    # Compliance dates
+    row["last_patch_date"] = ""
+    row["last_vuln_scan_date"] = ""
+    row["last_verified_at"] = ""
+    row["decommission_date"] = ""
+
+    # Notes
+    row["security_remarks"] = ""
     row["description"] = description
+
     return row
 
 
-def extract_vm(host, node, vmid, ticket, csrf, verify_ssl, cluster, storage_plugins=None):
-    """Orchestrate per-VM data collection and return a CSV row dict."""
-    config = get_vm_config(host, node, vmid, ticket, csrf, verify_ssl)
-    if not config:
-        raise RuntimeError(f"empty config for VM {vmid} on {node}")
+def write_csv(rows: list[dict], output_path: str) -> None:
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=TEMPLATE_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
 
-    status = get_vm_status(host, node, vmid, ticket, csrf, verify_ssl)
 
+def extract_vm(
+    client: ProxmoxClient,
+    node: str,
+    vmid: int,
+    cluster_name: str,
+    storage_meta: dict,
+) -> Optional[dict]:
+    """Extract a single VM's inventory. Returns None on skip."""
     try:
-        cpu_cores = int(config.get("cores", 0))
-    except (TypeError, ValueError):
-        cpu_cores = 0
-    try:
-        memory_mb = int(config.get("memory", 0))
-    except (TypeError, ValueError):
-        memory_mb = 0
+        config = client.get_vm_config(node, vmid)
+    except Exception as e:
+        print(f"[warn] Failed to get config for VM {vmid} on {node}: {e}", file=sys.stderr)
+        return None
 
-    disks, disk_provenance, storage_used = parse_disks_with_provenance(
-        config, storage_plugins
-    )
+    status = config.get("status", "unknown")
+    if status not in ("running", "stopped"):
+        # Still try to extract; status will be 'unknown'
+        pass
+
+    description = config.get("description", "")
     tags = parse_tags(config)
 
+    # Disks
+    disks = parse_disks(config, storage_meta)
+
+    # Guest agent data (only if agent enabled)
     agent_enabled = config.get("agent", "")
-    ips = []
+    ips: list[str] = []
+    os_info: dict[str, Optional[str]] = {"os_family": None, "os_distribution": None, "os_version": None}
+    fqdn: Optional[str] = None
+
     if agent_enabled and agent_enabled not in ("0", "none", ""):
         try:
-            ips = get_guest_agent_ips(host, node, vmid, ticket, csrf, verify_ssl)
+            ips = client.get_guest_ips(node, vmid)
         except Exception as e:
-            print(f"[warn] guest agent IP fetch failed for VM {vmid}: {e}", file=sys.stderr)
-    if not ips:
+            print(f"[warn] Guest agent IP fetch failed for VM {vmid}: {e}", file=sys.stderr)
+
+        if not ips:
+            ips = extract_ips_from_tags(tags)
+
+        try:
+            os_info = client.get_guest_os(node, vmid)
+        except Exception as e:
+            print(f"[warn] Guest agent OS fetch failed for VM {vmid}: {e}", file=sys.stderr)
+
+        try:
+            fqdn = client.get_guest_fqdn(node, vmid)
+        except Exception as e:
+            print(f"[warn] Guest agent FQDN fetch failed for VM {vmid}: {e}", file=sys.stderr)
+    else:
         ips = extract_ips_from_tags(tags)
+
     ips_by_role = classify_ips(ips)
 
-    os_info = detect_os(host, node, vmid, config, ticket, csrf, verify_ssl) if agent_enabled \
-              else {"os_family": OSTYPE_FAMILY.get(config.get("ostype", "")),
-                    "os_distribution": None, "os_version": None}
-
-    extra_tags = format_storage_tags(storage_used)
-    description = MULTI_SEP.join(disk_provenance) if disk_provenance else ""
-
-    return build_row({
-        "name": config.get("name", f"vm-{vmid}"),
-        "node": node,
-        "config": config,
-        "status": status,
-        "os": os_info,
-        "ips_by_role": ips_by_role,
-        "disks": disks,
-        "tags": tags,
-        "fqdn": config.get("name", f"vm-{vmid}"),
-        "cluster": cluster,
-        "vmid": vmid,  # Proxmox VMID → CSV external_id per InventoryMGR schema
-        "memory_mb": memory_mb,
-        "cpu_cores": cpu_cores,
-        "description": description,
-        "extra_tags": extra_tags,
-    })
+    return serialize_vm(
+        vmid=vmid,
+        config=config,
+        status=status,
+        node=node,
+        cluster_name=cluster_name,
+        disks=disks,
+        ips_by_role=ips_by_role,
+        os_info=os_info,
+        fqdn=fqdn,
+        description=description,
+        tags=tags,
+    )
 
 
-def parse_disks_with_provenance(config, storage_plugins):
-    """Parse disks like parse_disks but also return provenance lines and storage tags.
-
-    Returns (disks, provenance_lines, storage_plugins_seen) where:
-      disks: list of (name, size_gb) tuples
-      provenance_lines: list of provenance description strings
-      storage_plugins_seen: {storage_name: plugin} for unique storages used
-    """
-    out_disks = []
-    provenance = []
-    seen_plugins = {}
-
-    for key in DISK_KEYS:
-        val = config.get(key)
-        if not val or val == "none":
-            continue
-        m = re.search(r"size=(\d+(?:\.\d+)?)\s*([KMGT])?", val)
-        if not m:
-            continue
-        size_num = float(m.group(1))
-        unit = m.group(2) or "G"
-        size_bytes = int(size_num * SIZE_UNITS[unit])
-        size_gb = size_bytes // SIZE_UNITS["G"]
-
-        storage, vol_name, _attrs = split_disk_value(val)
-
-        if (storage_plugins is not None
-                and storage is not None
-                and vol_name is not None
-                and is_lv_name(vol_name)
-                and is_block_plugin(storage_plugins.get(storage, ""))):
-            plugin = storage_plugins[storage]
-            name = f"{plugin}:{vol_name}"
-            seen_plugins[storage] = plugin
-            provenance.append(
-                format_disk_provenance(key, storage, vol_name, plugin, size_gb)
-            )
-        else:
-            name = key  # legacy / file storage
-
-        out_disks.append((name, int(size_gb)))
-    
-    return out_disks, provenance, seen_plugins
-
-
-def write_csv(rows, path):
-    """Write a list of row dicts to a CSV file. Returns number of data rows written."""
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS, quoting=csv.QUOTE_MINIMAL)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    return len(rows)
-
-
-def get_password(cli_password):
-    """Resolve password: CLI arg > env var > interactive prompt."""
-    if cli_password:
-        return cli_password
-    if "PVE_PASSWORD" in os.environ:
-        return os.environ["PVE_PASSWORD"]
-    import getpass
-    return getpass.getpass("Proxmox password: ")
-
-
-def main():
-    """Entry point: parse args, authenticate, iterate nodes/VMs, write CSV."""
+def main() -> int:
     args = parse_args(sys.argv[1:])
+    password = resolve_password(args)
 
-    verify_ssl = not args.insecure
+    client = ProxmoxClient(
+        host=args.host,
+        user=args.user,
+        password=password,
+        verify_ssl=not args.insecure,
+    )
 
-    print(f"Connecting to {args.host} as {args.user}...", file=sys.stderr)
-    ticket, csrf = get_ticket(args.host, args.user, args.password, verify_ssl)
+    try:
+        client.get_ticket()
+    except Exception as e:
+        print(f"[error] Authentication failed: {e}", file=sys.stderr)
+        return 1
 
-    print("Fetching PLUGIN info...", file=sys.stderr)
-    cluster = get_cluster_name(args.host, ticket, csrf, verify_ssl)
+    cluster_name = client.get_cluster_name()
 
-    print("Enumerating nodes...", file=sys.stderr)
-    nodes = get_nodes(args.host, ticket, csrf, verify_ssl)
+    nodes = client.get_nodes()
+    if not nodes:
+        print("[warn] No online nodes found", file=sys.stderr)
 
-    all_rows = []
+    all_rows: list[dict] = []
+    partial_failure = False
+
     for node in nodes:
-        print(f"Scanning VMs on {node}...", file=sys.stderr)
+        storage_meta = build_storage_meta(client, node)
 
-        # Fetch storage plugins once per node
         try:
-            storage_plugins = get_storage_plugins(args.host, node, ticket, csrf, verify_ssl)
+            vms = client.get_vms_for_node(node)
         except Exception as e:
-            print(f"  [warn] storage plugin fetch failed for {node}: {e}", file=sys.stderr)
-            storage_plugins = None
+            print(f"[warn] Failed to enumerate VMs on node {node}: {e}", file=sys.stderr)
+            partial_failure = True
+            continue
 
-        vmids = get_vms_for_node(args.host, node, ticket, csrf, verify_ssl)
-        for vmid in vmids:
-            try:
-                row = extract_vm(args.host, node, vmid, ticket, csrf, verify_ssl, cluster, storage_plugins)
+        for vm in vms:
+            vmid = vm.get("vmid")
+            if vmid is None:
+                continue
+            row = extract_vm(client, node, vmid, cluster_name, storage_meta)
+            if row is not None:
                 all_rows.append(row)
-                print(f"  VM {vmid} ({row['name']}): {row['status']}", file=sys.stderr)
-            except Exception as e:
-                print(f"  [error] VM {vmid} on {node}: {e}", file=sys.stderr)
+            else:
+                partial_failure = True
 
+    # Determine output path
     if args.output:
-        out_path = args.output
+        output_path = args.output
     else:
-        ts = datetime.datetime.now().isoformat(timespec="seconds").replace(":", "-")
-        out_path = f"/tmp/proxmox-inventory-{ts}.csv"
+        ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
+        output_path = f"/tmp/proxmox-inventory-{ts}.csv"
 
-    write_csv(all_rows, out_path)
-    print(f"Wrote {len(all_rows)} VMs to {out_path}", file=sys.stderr)
+    try:
+        write_csv(all_rows, output_path)
+    except Exception as e:
+        print(f"[error] Failed to write CSV: {e}", file=sys.stderr)
+        return 1
+
+    print(f"[ok] Wrote {len(all_rows)} VM(s) to {output_path}")
+    if partial_failure:
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
