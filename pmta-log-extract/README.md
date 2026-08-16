@@ -1,24 +1,22 @@
 # PMTA Log Extract
 
-Stream-extract records from large PowerMTA (PMTA) accounting logs (CSV or line-delimited JSON) by sender (`orig`) and/or recipient (`rcpt`). Supports compressed archives (`.tar.gz`, `.tar.bz2`, `.zip`), glob patterns, exact/contains/domain matching, AND/OR logic, and type filtering.
+Stream-extract records from large PowerMTA (PMTA) accounting logs (CSV or line-delimited JSON) by sender (`orig`) and/or recipient (`rcpt`). Supports compressed archives (`.tar.gz`, `.tar.bz2`, `.zip`), glob patterns, substring matching, Cartesian AND for multiple orig/rcpt values, and type filtering.
 
 ## Quick Start
 
 ```bash
-# Extract all records for a sender domain
-./pmta-log-extract.py --orig "@example.com" --input /var/log/pmta/acct-*.csv --output matches.csv
+# Extract all records for a sender (CONTAINS match)
+./pmta-log-extract.py --orig "example.com" --path "/var/log/pmta/acct-*.csv" --out matches.csv
 
-# Extract for specific recipient with domain matching
-./pmta-log-extract.py --rcpt "user@domain.com" --input /var/log/pmta/*.csv.gz --output out.csv
+# Extract for specific recipient
+./pmta-log-extract.py --rcpt "user@domain.com" --path "/var/log/pmta/*.csv.gz" --out out.csv
 
-# Multiple patterns with AND logic (match orig AND rcpt)
-./pmta-log-extract.py --orig "alerts@" --rcpt "@company.com" --match all --input logs/ --output filtered.csv
+# Cartesian AND: multiple senders AND multiple recipients
+# Matches records where orig∈{alerts@,billing@} AND rcpt∈{@company.com,@partner.com}
+./pmta-log-extract.py --orig "alerts@,billing@" --rcpt "@company.com,@partner.com" --path logs/ --out filtered.csv
 
-# OR logic (match orig OR rcpt)
-./pmta-log-extract.py --orig "bounce@" --rcpt "complaint@" --match any --input logs/ --output filtered.csv
-
-# Raw passthrough mode (no parsing, just grep)
-./pmta-log-extract.py --raw --pattern "error" --input /var/log/pmta/*.log --output errors.txt
+# Field-agnostic: match anywhere (sender or recipient), AND-combined with orig/rcpt
+./pmta-log-extract.py --any "example.com" --path logs/ --out filtered.csv
 ```
 
 ## Options
@@ -26,21 +24,17 @@ Stream-extract records from large PowerMTA (PMTA) accounting logs (CSV or line-d
 ### Input
 | Flag | Description |
 |------|-------------|
-| `--input PATH` | Input file(s), directory, or glob pattern (required) |
-| `--recursive`, `-r` | Recurse into directories | 
-| `--format {csv,json,auto}` | Force input format (default: auto-detect) |
+| `--path GLOB` | Input file(s), directory, or glob pattern (required). Repeatable. Supports `*` and recursive `**`. |
+| `--format {csv,json,auto}` | Force input format (default: auto-detect by magic bytes) |
 
 ### Matching
 | Flag | Description |
 |------|-------------|
-| `--orig PATTERN` | Match sender (orig) field |
-| `--rcpt PATTERN` | Match recipient (rcpt) field |
-| `--any PATTERN` | Match against orig OR rcpt (shorthand) |
-| `--match {all,any}` | `all` = AND logic, `any` = OR logic (default: `all` when both `--orig` and `--rcpt` given) |
-| `--type TYPE` | Filter by record type (e.g., `d`, `b`, `t`, `q`) |
-| `--exact` | Exact match (default: contains) |
-| `--domain` | Domain-style match (pattern treated as domain suffix) |
-| `--case-sensitive` | Case-sensitive matching (default: case-insensitive) |
+| `--orig PATTERN` | Match sender (orig) field. Case-insensitive. Repeatable. Supports `@file` for pattern files. Multiple values create Cartesian AND with `--rcpt`. |
+| `--rcpt PATTERN` | Match recipient (rcpt) field. Case-insensitive. Repeatable. Supports `@file` for pattern files. Multiple values create Cartesian AND with `--orig`. |
+| `--any PATTERN` | Match against orig OR rcpt. Same syntax as `--orig`/`--rcpt`. AND-combined with orig/rcpt result. |
+| `--type TYPE` | Filter by record type (e.g., `d`, `b`, `t`, `q`). Repeatable. |
+| `--fields F[,F...]` | Output fields. Default: auto-discovered union. Use `*` for all. |
 
 ### Output
 | Flag | Description |
@@ -70,24 +64,39 @@ Stream-extract records from large PowerMTA (PMTA) accounting logs (CSV or line-d
 
 ## Pattern Matching Details
 
-### Domain Matching (`--domain`)
+All matching is **case-insensitive substring (CONTAINS)** by default.
+
 ```
---orig "@example.com" --domain
+--orig "example.com"
 ```
-Matches: `user@example.com`, `alerts@sub.example.com`, `mail.example.com`
+Matches: `user@example.com`, `alerts@sub.example.com`, `myexample@domain.com`
+
+To match a full domain suffix, include the `@` in the pattern:
+```
+--orig "@example.com"
+```
+Matches: `user@example.com`, `alerts@sub.example.com`
 Does not match: `user@fake-example.com`
 
-### Contains Matching (default)
+For exact address matching, the pattern must match the entire address:
 ```
---orig "alerts"
-```
-Matches: `alerts@example.com`, `server-alerts@domain.com`, `myalerts@test.com`
-
-### Exact Matching (`--exact`)
-```
---orig "alerts@example.com" --exact
+--orig "alerts@example.com"
 ```
 Matches only: `alerts@example.com`
+
+### Cartesian AND with Multiple Values
+
+When multiple `--orig` and `--rcpt` values are given, **all combinations are tested** (Cartesian product):
+
+```
+--orig "a@x.com,b@x.com" --rcpt "c@y.com,d@y.com"
+```
+Matches records where:
+- orig = a@x.com AND rcpt = c@y.com
+- orig = a@x.com AND rcpt = d@y.com
+- orig = b@x.com AND rcpt = c@y.com
+- orig = b@x.com AND rcpt = d@y.com
+```
 
 ## Record Types (PMTA Accounting)
 
