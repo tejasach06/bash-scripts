@@ -12,6 +12,7 @@ Collection of production-ready scripts for system administration, security audit
 | [**pmta-log-extract**](./pmta-log-extract/) | Python | Stream-extract records from large PowerMTA accounting logs by sender/recipient |
 | [**proxmox-inventory-extract**](./proxmox-inventory-extract/) | Python | Extract VM inventory from Proxmox cluster via REST API, output CSV for InventoryMGR import |
 | [**checkmk-deploy-multisite**](./checkmk-deploy-multisite/) | Bash | Deploy Checkmk Central + Remote sites for monitoring Proxmox clusters on openSUSE |
+| [**sysdiag**](./sysdiag/) | Bash | Distro-agnostic read-only Linux diagnostics and RCA evidence collector with menu and report modes |
 
 ## Quick Navigation
 
@@ -60,6 +61,13 @@ sudo ./checkmk-deploy-multisite.sh
 ```
 [**→ Full README**](./checkmk-deploy-multisite/README.md)
 
+### Sysdiag
+```bash
+cd sysdiag
+./sysdiag.sh --all --package --out /tmp/sysdiag-case
+```
+[**→ Full README**](./sysdiag/README.md)
+
 ## Repository Structure
 
 ```
@@ -81,6 +89,9 @@ bash-scripts/
 │   └── README.md
 ├── checkmk-deploy-multisite/
 │   ├── checkmk-deploy-multisite.sh
+│   └── README.md
+├── sysdiag/
+│   ├── sysdiag.sh
 │   └── README.md
 ├── test_proxmox_inventory_extract.py    # Test suite for proxmox-inventory
 ├── test-script.sh                        # Generic test helper
