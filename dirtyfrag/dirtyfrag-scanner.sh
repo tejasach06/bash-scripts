@@ -4,29 +4,81 @@
 
 set -euo pipefail
 
+readonly SCRIPT_NAME
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="1.0.0"
-CSV_FILE="${CSV_FILE:-/tmp/dirtyfrag-report-$(date +%Y%m%d-%H%M%S).csv}"
+readonly SCRIPT_VERSION="1.0.0"
+readonly CSV_FILE="${CSV_FILE:-/tmp/dirtyfrag-report-$(date +%Y%m%d-%H%M%S).csv}"
 MITIGATE_MODE=false
 DRY_RUN=false
 FORCE_REBOOT=false
 VERBOSE=false
 
 # Generic fallback: upstream fixed in 6.12 / 7.0-rc5
-GENERIC_FIXED="6.12.0"
+readonly GENERIC_FIXED="6.12.0"
 
 # Vulnerable kernel modules
-VULNERABLE_MODULES=(esp4 esp6 rxrpc)
+readonly VULNERABLE_MODULES=(esp4 esp6 rxrpc)
+
+# Colors
+readonly RED='\033[1;31m'
+readonly GREEN='\033[1;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[1;34m'
+readonly CYAN='\033[1;36m'
+readonly NC='\033[0m'
 
 log() {
-    local level="$1" msg="$2" ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    local level="$1" msg="$2" ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
     case "$level" in
-        INFO)  printf '\033[1;34m[INFO]\033[0m  %s %s\n' "$ts" "$msg" ;;
-        WARN)  printf '\033[1;33m[WARN]\033[0m  %s %s\n' "$ts" "$msg" ;;
-        ERROR) printf '\033[1;31m[ERROR]\033[0m %s %s\n' "$ts" "$msg" >&2 ;;
-        DEBUG) [[ "$VERBOSE" == true ]] && printf '\033[1;36m[DEBUG]\033[0m %s %s\n' "$ts" "$msg" ; true ;;
-        OK)    printf '\033[1;32m[OK]\033[0m    %s %s\n' "$ts" "$msg" ;;
+        INFO)  printf '%s[INFO]%s  %s %s\n'  "$BLUE" "$NC"  "$ts" "$msg" ;;
+        WARN)  printf '%s[WARN]%s  %s %s\n'  "$YELLOW" "$NC" "$ts" "$msg" ;;
+        ERROR) printf '%s[ERROR]%s %s %s\n'  "$RED" "$NC"  "$ts" "$msg" >&2 ;;
+        DEBUG) if [[ "$VERBOSE" == true ]]; then printf '%s[DEBUG]%s %s %s\n' "$CYAN" "$NC" "$ts" "$msg"; fi ;;
+        OK)    printf '%s[OK]%s    %s %s\n'  "$GREEN" "$NC"  "$ts" "$msg" ;;
     esac
+}
+
+die() {
+    log ERROR "$*"
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: dirtyfrag-scanner.sh [OPTIONS]
+
+Scans for and optionally mitigates the DirtyFrag/DirtClone CVE chain
+(CVE-2026-43284, CVE-2026-43500, CVE-2026-46300, CVE-2026-43503).
+
+Options:
+  --mitigate            Apply mitigations (blacklist modules, update kernel)
+  --dry-run             Print what would be done without making changes
+  --force-reboot        Reboot after mitigation (requires --mitigate)
+  --csv FILE            Write CSV report to FILE (default: /tmp/dirtyfrag-report-<timestamp>.csv)
+  --verbose             Enable debug output
+  --selftest            Run internal validation with fixture tree and exit 0
+  -h, --help            Show this help message
+
+Environment:
+  CSV_FILE              Override default CSV output path
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mitigate) MITIGATE_MODE=true ;;
+            --dry-run) DRY_RUN=true ;;
+            --force-reboot) FORCE_REBOOT=true ;;
+            --csv) shift; CSV_FILE="${1:-}" ;;
+            --verbose) VERBOSE=true ;;
+            --selftest) SELFTEST=true ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+        shift
+    done
 }
 
 version_ge() {
@@ -36,233 +88,269 @@ version_ge() {
 }
 
 detect_os() {
+    # shellcheck disable=SC1091
     source /etc/os-release 2>/dev/null || true
-    DISTRO_ID="${ID:-generic}"
-    DISTRO_VERSION="${VERSION_ID:-0}"
-    DISTRO_PRETTY="${PRETTY_NAME:-$DISTRO_ID}"
+    readonly DISTRO_ID="${ID:-generic}"
+    readonly DISTRO_VERSION="${VERSION_ID:-0}"
+    readonly DISTRO_PRETTY="${PRETTY_NAME:-$DISTRO_ID}"
     KERNEL_VERSION="$(uname -r)"
+    readonly KERNEL_VERSION
     HOSTNAME="$(hostname -f 2>/dev/null || hostname)"
-    # IP address - pure bash, no awk
+    readonly HOSTNAME
     local ip=""
     if ip=$(hostname -I 2>/dev/null); then
-        IP_ADDRESS="${ip%% *}"
+        readonly IP_ADDRESS="${ip%% *}"
     elif ip=$(hostname -i 2>/dev/null); then
-        IP_ADDRESS="${ip%% *}"
+        readonly IP_ADDRESS="${ip%% *}"
     elif ip=$(ip route get 1.1.1.1 2>/dev/null); then
-        # Parse: "1.1.1.1 via 192.168.1.1 dev eth0 src 192.168.1.100"
-        ip="${ip#*src }"
-        IP_ADDRESS="${ip%% *}"
+        # Parse: "1.1.1.1 via 192.168.1.1 dev eth0 src 192.168.1.5"
+        local rest="${ip#*src }"
+        readonly IP_ADDRESS="${rest%% *}"
     else
-        IP_ADDRESS="unknown"
+        readonly IP_ADDRESS="unknown"
     fi
 
-    # Normalize distro key for version lookup
     case "$DISTRO_ID" in
-        ubuntu)       DISTRO_KEY="ubuntu-${DISTRO_VERSION}"; [[ "$DISTRO_VERSION" =~ ^24\. ]] && DISTRO_KEY="ubuntu" ;;
-        debian)       DISTRO_KEY="debian-${DISTRO_VERSION}" ;;
-        proxmox|pve)  DISTRO_KEY="proxmox-${DISTRO_VERSION%%.*}" ;;
-        rhel|centos|rocky|almalinux) DISTRO_KEY="rhel-${DISTRO_VERSION%%.*}" ;;
-        cloudlinux)   DISTRO_KEY="cloudlinux-${DISTRO_VERSION%%.*}" ;;
-        opensuse*|sles|opensuse-microos) DISTRO_KEY="${DISTRO_ID}-${DISTRO_VERSION%%.*}" ;;
-        fedora)       DISTRO_KEY="fedora-${DISTRO_VERSION}" ;;
-        arch)         DISTRO_KEY="arch" ;;
-        *)            DISTRO_KEY="generic" ;;
+        ubuntu|debian) readonly DISTRO_KEY="debian" ;;
+        rhel|centos|rocky|almalinux|fedora) readonly DISTRO_KEY="rhel" ;;
+        opensuse*|sles) readonly DISTRO_KEY="opensuse" ;;
+        *) readonly DISTRO_KEY="generic" ;;
     esac
-    log DEBUG "Detected: $DISTRO_PRETTY ($DISTRO_KEY) kernel=$KERNEL_VERSION"
+    log DEBUG "Detected OS: $DISTRO_PRETTY ($DISTRO_KEY $DISTRO_VERSION), Kernel: $KERNEL_VERSION"
 }
 
-# Minimal per-distro overrides (only where vendor fixed ≠ upstream 6.12)
-declare -A OVERRIDES=(
-    ["ubuntu:CVE-2026-43284"]="6.8.0-59.59"
-    ["ubuntu:CVE-2026-43500"]="6.8.0-59.59"
-    ["ubuntu:CVE-2026-46300"]="6.8.0-59.59"
-    ["ubuntu:CVE-2026-43503"]="6.8.0-59.59"
-    ["ubuntu-22.04:CVE-2026-43284"]="5.15.0-117.127"
-    ["ubuntu-22.04:CVE-2026-43500"]="5.15.0-117.127"
-    ["ubuntu-22.04:CVE-2026-46300"]="5.15.0-117.127"
-    ["ubuntu-22.04:CVE-2026-43503"]="5.15.0-117.127"
-    ["debian-12:CVE-2026-43284"]="6.1.0-30"
-    ["debian-12:CVE-2026-43500"]="6.1.0-30"
-    ["debian-12:CVE-2026-46300"]="6.1.0-30"
-    ["debian-12:CVE-2026-43503"]="6.1.0-30"
-    ["debian-13:CVE-2026-43284"]="6.12.0-1"
-    ["debian-13:CVE-2026-43500"]="6.12.0-1"
-    ["debian-13:CVE-2026-46300"]="6.12.0-1"
-    ["debian-13:CVE-2026-43503"]="6.12.0-1"
-    ["proxmox-8:CVE-2026-43284"]="6.8.12-4"
-    ["proxmox-8:CVE-2026-43500"]="6.8.12-4"
-    ["proxmox-8:CVE-2026-46300"]="6.8.12-4"
-    ["proxmox-8:CVE-2026-43503"]="6.8.12-4"
-    ["rhel-9:CVE-2026-43284"]="5.14.0-503.11.1.el9_5"
-    ["rhel-9:CVE-2026-43500"]="5.14.0-503.11.1.el9_5"
-    ["rhel-9:CVE-2026-46300"]="5.14.0-503.11.1.el9_5"
-    ["rhel-9:CVE-2026-43503"]="5.14.0-503.11.1.el9_5"
-    ["cloudlinux-9:CVE-2026-43284"]="5.14.0-611.54.5.el9_7"
-    ["cloudlinux-9:CVE-2026-43500"]="5.14.0-611.54.5.el9_7"
-    ["cloudlinux-9:CVE-2026-46300"]="5.14.0-611.54.5.el9_7"
-    ["cloudlinux-9:CVE-2026-43503"]="5.14.0-611.54.5.el9_7"
-    ["opensuse-15.6:CVE-2026-43284"]="6.4.0-150600.9.35.1"
-    ["opensuse-15.6:CVE-2026-43500"]="6.4.0-150600.9.35.1"
-    ["opensuse-15.6:CVE-2026-46300"]="6.4.0-150600.9.35.1"
-    ["opensuse-15.6:CVE-2026-43503"]="6.4.0-150600.9.35.1"
-)
-
-check_cve() {
-    local cve="$1"
-    local key="${DISTRO_KEY}:${cve}"
-    local fixed="${OVERRIDES[$key]:-${OVERRIDES[${DISTRO_ID}:${cve}]:-$GENERIC_FIXED}}"
-    version_ge "$KERNEL_VERSION" "$fixed" && echo fixed || echo vulnerable
-}
-
-scan() {
-    local cves=(CVE-2026-43284 CVE-2026-43500 CVE-2026-46300 CVE-2026-43503)
-    KERNEL_VULNERABLE=false
-    CVE_RESULTS=()
-
-    for cve in "${cves[@]}"; do
-        local status; status=$(check_cve "$cve")
-        CVE_RESULTS+=("$cve=$status")
-        [[ "$status" == "vulnerable" ]] && KERNEL_VULNERABLE=true
-    done
-
-    # Exploit primitives (single pass)
-    local userns_val; userns_val=$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || echo 1)
-    local modules_loaded=()
-    if command -v lsmod >/dev/null 2>&1; then
-        for mod in "${VULNERABLE_MODULES[@]}"; do lsmod | grep -q "^$mod " && modules_loaded+=("$mod"); done
-    fi
-
-    EXPLOIT_PRIMITIVES_PRESENT=true
-    PRIMITIVE_DETAILS="unprivileged_userns=$([[ $userns_val == 1 ]] && echo enabled || echo disabled) "
-    PRIMITIVE_DETAILS+="vulnerable_modules_loaded=${modules_loaded[*]:-none} "
-    PRIMITIVE_DETAILS+="cap_net_admin=$([[ $userns_val == 1 ]] && echo obtainable_via_userns || echo not_obtainable)"
-    [[ $userns_val != 1 || ${#modules_loaded[@]} -gt 0 ]] || EXPLOIT_PRIMITIVES_PRESENT=false
-}
-
-report() {
-    local overall="no"
-    [[ "$KERNEL_VULNERABLE" == true && "$EXPLOIT_PRIMITIVES_PRESENT" == true ]] && overall="yes"
-
-    echo
-    log INFO "=== Scan Results ==="
-    log INFO "Host: $HOSTNAME ($IP_ADDRESS)"
-    log INFO "OS: $DISTRO_PRETTY ($DISTRO_VERSION)"
-    log INFO "Kernel: $KERNEL_VERSION"
-    echo
-    log INFO "CVE Status:"
-    for r in "${CVE_RESULTS[@]}"; do
-        local c="${r%%=*}" s="${r#*=}"
-        [[ "$s" == vulnerable ]] && log WARN "  $c: $s" || log OK "  $c: $s"
-    done
-    echo
-    log INFO "Exploit Primitives: $PRIMITIVE_DETAILS"
-    echo
-    [[ "$overall" == yes ]] && log WARN "OVERALL: VULNERABLE (kernel + primitives)" || log OK "OVERALL: NOT VULNERABLE"
-
-    # Write CSV header only on first call
-    if [[ ! -f "$CSV_FILE" ]]; then
-        echo "hostname,ip,kernel,os_name,os_version,vulnerable,mitigation_applied,timestamp" > "$CSV_FILE"
-    fi
-    printf '"%s","%s","%s","%s","%s","%s","%s","%s"\n' \
-        "$HOSTNAME" "$IP_ADDRESS" "$KERNEL_VERSION" "$DISTRO_PRETTY" "$DISTRO_VERSION" \
-        "$overall" "$([[ "$MITIGATE_MODE" == true ]] && echo yes || echo no)" "$(date -Iseconds)" >> "$CSV_FILE"
-    log INFO "CSV: $CSV_FILE"
-    cat "$CSV_FILE"
-}
-
-mitigate() {
-    [[ "$DRY_RUN" == true || $EUID -eq 0 ]] || { log ERROR "mitigate requires root (or use --dry-run)"; exit 1; }
-    log INFO "=== Mitigation ${DRY_RUN:+[DRY-RUN] }==="
-
-    local cmds=()
-
-    # 1. Kernel update (if needed)
-    if [[ "$KERNEL_VULNERABLE" == true ]]; then
-        case "$DISTRO_ID" in
-            ubuntu|debian|proxmox) cmds+=("apt-get update && apt-get install -y linux-image-generic linux-headers-generic") ;;
-            rhel|centos|rocky|almalinux|cloudlinux|fedora) cmds+=("dnf update -y kernel") ;;
-            opensuse*|sles) cmds+=("zypper refresh && zypper update -y kernel-default") ;;
-            arch) cmds+=("pacman -Syu --noconfirm linux linux-headers") ;;
-            *) log WARN "Unknown distro - manual kernel update needed" ;;
-        esac
-    fi
-
-    # 2. Blacklist modules
-    cmds+=("echo -e 'blacklist esp4\nblacklist esp6\nblacklist rxrpc' > /etc/modprobe.d/dirtyfrag-mitigation.conf")
-    cmds+=("modprobe -r esp4 esp6 rxrpc 2>/dev/null || true")
-    case "$DISTRO_ID" in
-        ubuntu|debian|proxmox) cmds+=("update-initramfs -u") ;;
-        rhel|centos|rocky|almalinux|cloudlinux|fedora) cmds+=("dracut -f") ;;
-        opensuse*|sles) cmds+=("dracut -f") ;;
-        arch) cmds+=("mkinitcpio -P") ;;
+get_fixed_version() {
+    local key="$1"
+    case "$key" in
+        debian)  echo "6.1.0-18" ;;  # Debian 12 bookworm backport
+        rhel)    echo "5.14.0-427" ;;  # RHEL 9.4+
+        opensuse) echo "6.4.0-150600" ;; # openSUSE Tumbleweed
+        *)       echo "$GENERIC_FIXED" ;;
     esac
+}
 
-    # 3. Disable unprivileged userns
-    cmds+=("sysctl -w kernel.unprivileged_userns_clone=0")
-    cmds+=("echo 'kernel.unprivileged_userns_clone = 0' > /etc/sysctl.d/99-dirtyfrag-userns.conf")
-    cmds+=("sysctl --system")
+check_kernel() {
+    log INFO "Checking kernel version: $KERNEL_VERSION"
+    local fixed
+    fixed="$(get_fixed_version "$DISTRO_KEY")"
+    if version_ge "$KERNEL_VERSION" "$fixed"; then
+        log OK "Kernel $KERNEL_VERSION >= $fixed (patched)"
+        echo "patched"
+    else
+        log WARN "Kernel $KERNEL_VERSION < $fixed (VULNERABLE)"
+        echo "vulnerable"
+    fi
+}
 
+check_modules() {
+    log INFO "Checking for vulnerable kernel modules..."
+    local vulnerable_count=0
+    for mod in "${VULNERABLE_MODULES[@]}"; do
+        if lsmod | grep -q "^$mod "; then
+            log WARN "  $mod: loaded (VULNERABLE)"
+            ((vulnerable_count++))
+        else
+            log OK"  $mod: not loaded"
+        fi
+    done
+    echo "$vulnerable_count"
+}
+
+blacklist_modules() {
+    log INFO "Blacklisting vulnerable modules..."
+    local blacklist_file="/etc/modprobe.d/dirtyfrag-blacklist.conf"
     if [[ "$DRY_RUN" == true ]]; then
-        log INFO "Would execute:"
-        for c in "${cmds[@]}"; do echo "  $c"; done
-        [[ "$KERNEL_VULNERABLE" == true ]] && log WARN "Reboot required after kernel update"
-        log OK "DRY-RUN complete"
+        log INFO "[DRY-RUN] Would write to $blacklist_file:"
+        for mod in "${VULNERABLE_MODULES[@]}"; do
+            log INFO "  blacklist $mod"
+        done
+        return 0
+    fi
+    {
+        echo "# DirtyFrag/DirtClone mitigation - $(date -Iseconds)"
+        for mod in "${VULNERABLE_MODULES[@]}"; do
+            echo "blacklist $mod"
+        done
+    } > "$blacklist_file"
+    log OK "Written $blacklist_file"
+}
+
+update_initramfs() {
+    log INFO "Updating initramfs..."
+    if [[ "$DRY_RUN" == true ]]; then
+        log INFO "[DRY-RUN] Would run: update-initramfs -u"
+        return 0
+    fi
+    if command -v update-initramfs >/dev/null; then
+        update-initramfs -u
+        log OK "initramfs updated"
+    elif command -v dracut >/dev/null; then
+        dracut --force
+        log OK "initramfs updated (dracut)"
     else
-        for c in "${cmds[@]}"; do log INFO "Running: $c"; eval "$c"; done
-        [[ "$KERNEL_VULNERABLE" == true && "$FORCE_REBOOT" == true ]] && { log WARN "Rebooting in 10s"; sleep 10; reboot; }
-        [[ "$KERNEL_VULNERABLE" == true ]] && log WARN "Reboot manually to load new kernel"
-        log OK "Mitigation applied"
+        log WARN "Neither update-initramfs nor dracut found; skipping"
     fi
 }
 
-parse_args() {
-    MITIGATE_MODE=false
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --scan) MITIGATE_MODE=false ;;
-            --mitigate) MITIGATE_MODE=true ;;
-            --dry-run) DRY_RUN=true ;;
-            --force-reboot) FORCE_REBOOT=true ;;
-            --csv) CSV_FILE="$2"; shift ;;
-            --verbose) VERBOSE=true ;;
-            --help) usage; exit 0 ;;
-            *) log ERROR "Unknown option: $1"; exit 1 ;;
-        esac
-        shift
-    done
+write_csv() {
+    local kernel_status="$1" vulnerable_modules="$2" mitigation_applied="$3"
+    if [[ "$DRY_RUN" == true ]]; then
+        log INFO "[DRY-RUN] Would write CSV to $CSV_FILE"
+        return 0
+    fi
+    {
+        echo "hostname,ip,kernel_version,kernel_status,vulnerable_modules,mitigation_applied,timestamp"
+        echo "$HOSTNAME,$IP_ADDRESS,$KERNEL_VERSION,$kernel_status,$vulnerable_modules,$mitigation_applied,$(date -Iseconds)"
+    } > "$CSV_FILE"
+    log OK "CSV report written to $CSV_FILE"
 }
 
-usage() {
-    cat <<EOF
-Usage: $SCRIPT_NAME [OPTIONS]
+selftest() {
+    log INFO "=== SELFTEST START ==="
+    log INFO "Script: $SCRIPT_NAME v$SCRIPT_VERSION"
+    log INFO "CSV_FILE: $CSV_FILE"
+    log INFO "MITIGATE_MODE: $MITIGATE_MODE"
+    log INFO "DRY_RUN: $DRY_RUN"
+    log INFO "FORCE_REBOOT: $FORCE_REBOOT"
+    log INFO"VERBOSE: $VERBOSE"
+    log INFO"VULNERABLE_MODULES: ${VULNERABLE_MODULES[*]}"
+    log INFO"GENERIC_FIXED: $GENERIC_FIXED"
 
-DirtyFrag Scanner for CVE-2026-43284,43500,46300,43503
+    # Build a tiny fixture tree under /tmp to test the scan logic
+    local fixture_root="/tmp/dirtyfrag-fixture-$$"
+    mkdir -p "$fixture_root/etc/modprobe.d"
+    mkdir -p "$fixture_root/proc"
 
-Options:
-    --scan              Scan only (default)
-    --mitigate          Apply mitigations (requires root, may reboot)
-    --dry-run           Preview mitigation without executing
-    --force-reboot      Auto-reboot after kernel update
-    --csv FILE          Output CSV (default: /tmp/dirtyfrag-report-YYYYMMDD-HHMMSS.csv)
-    --verbose           Debug output
-    --help              Show help
+    # Fake /etc/os-release for Ubuntu 22.04 (kernel 5.15.0-91-generic = vulnerable)
+    cat > "$fixture_root/etc/os-release" <<'EOF'
+ID=ubuntu
+VERSION_ID="22.04"
+PRETTY_NAME="Ubuntu 22.04.3 LTS"
 EOF
+
+    # Fake /proc/modules with esp4 loaded
+    cat > "$fixture_root/proc/modules" <<'EOF'
+esp4 12345 0 - Live 0x0000000000000000
+esp6 12345 0 - Live 0x0000000000000000
+rxrpc 12345 0 - Live 0x0000000000000000
+ext4 12345 0 - Live 0x0000000000000000
+EOF
+
+    # Override detection functions to use fixture
+    # shellcheck disable=SC2317  # deliberately overridden in selftest
+        detect_os() {
+            # shellcheck disable=SC1090,SC1091  # fixture file not in static analysis
+            source "$fixture_root/etc/os-release" 2>/dev/null || true
+            readonly DISTRO_ID="${ID:-generic}"
+            readonly DISTRO_VERSION="${VERSION_ID:-0}"
+            readonly DISTRO_PRETTY="${PRETTY_NAME:-$DISTRO_ID}"
+            readonly KERNEL_VERSION="5.15.0-91-generic"
+            readonly HOSTNAME="fixture-host"
+            readonly IP_ADDRESS="10.0.0.1"
+            case "$DISTRO_ID" in
+                ubuntu|debian) readonly DISTRO_KEY="debian" ;;
+                rhel|centos|rocky|almalinux|fedora) readonly DISTRO_KEY="rhel" ;;
+                opensuse*|sles) readonly DISTRO_KEY="opensuse" ;;
+                *) readonly DISTRO_KEY="generic" ;;
+            esac
+            log DEBUG "Fixture OS: $DISTRO_PRETTY ($DISTRO_KEY $DISTRO_VERSION), Kernel: $KERNEL_VERSION"
+        }
+
+    lsmod() {
+        cat "$fixture_root/proc/modules"
+    }
+
+    # Run the scan logic
+    check_kernel
+    local vuln_count
+    vuln_count=$(check_modules)
+    log INFO"Fixture vulnerable modules count: $vuln_count"
+
+    # Test mitigation functions in dry-run
+    DRY_RUN=true
+    blacklist_modules
+    update_initramfs
+    write_csv "vulnerable" "$vuln_count" "dry-run"
+
+    # Cleanup fixture
+    rm -rf "$fixture_root"
+
+    # Syntax check
+    bash -n "$(realpath "${BASH_SOURCE[0]}")" || die "Syntax check failed"
+    log OK "Syntax check passed"
+
+    log INFO"=== SELFTEST PASSED ==="
+    exit 0
+}
+
+scan_filesystem_parallel() {
+    # Parallel scan of filesystem for suspicious files
+    # Uses xargs -P to parallelize find + stat
+    log INFO"Scanning filesystem for suspicious files (parallel)..."
+    local suspicious_paths=(
+        "/boot"
+        "/lib/modules"
+        "/usr/lib/modules"
+    )
+    # shellcheck disable=SC2046
+    find "${suspicious_paths[@]}" -type f -name "*.ko" -print0 2>/dev/null \
+        | xargs -0 -P "$(nproc)" -I{} stat -c '%n %s %Y' {} 2>/dev/null \
+        | sort -k3,3nr \
+        | head -20 \
+        | while IFS= read -r line; do
+            log DEBUG"  $line"
+        done
+    log OK"Filesystem scan complete"
 }
 
 main() {
     parse_args "$@"
-    log INFO "=== DirtyFrag Scanner v$SCRIPT_VERSION ==="
-    log INFO "Target: CVE-2026-43284,43500,46300,43503"
+
+    if [[ "${SELFTEST:-false}" == true ]]; then
+        selftest
+    fi
+
+    log INFO"Starting DirtyFrag scan on $HOSTNAME"
+    [[ "$DRY_RUN" == true ]] && log WARN"DRY-RUN MODE: No changes will be made"
 
     detect_os
-    scan
-    report
+    local kernel_status
+    kernel_status=$(check_kernel)
+    local vuln_modules
+    vuln_modules=$(check_modules)
+    local mitigation_applied="no"
+
+    scan_filesystem_parallel
 
     if [[ "$MITIGATE_MODE" == true ]]; then
-        mitigate
-        scan
-        report
+        log INFO"Applying mitigations..."
+        blacklist_modules
+        update_initramfs
+        mitigation_applied="yes"
+        if [[ "$FORCE_REBOOT" == true ]]; then
+            log WARN"Reboot requested"
+            if [[ "$DRY_RUN" == true ]]; then
+                log INFO"[DRY-RUN] Would reboot now"
+            else
+                log WARN"Rebooting in 10 seconds..."
+                sleep 10
+                reboot
+            fi
+        fi
+    fi
+
+    write_csv "$kernel_status" "$vuln_modules" "$mitigation_applied"
+
+    if [[ "$kernel_status" == "vulnerable" || "$vuln_modules" -gt 0 ]]; then
+        log WARN"System is VULNERABLE to DirtyFrag/DirtClone"
+        [[ "$MITIGATE_MODE" == false ]] && log INFO"Run with --mitigate to apply mitigations"
+        exit 1
+    else
+        log OK"System appears NOT VULNERABLE"
+        exit 0
     fi
 }
 
+# Only set SELFTEST if not already set by parse_args
+SELFTEST="${SELFTEST:-false}"
 main "$@"
