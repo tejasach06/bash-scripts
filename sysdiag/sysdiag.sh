@@ -641,12 +641,12 @@ run_module() {
 }
 
 run_all_modules() {
-  run_module reboot
-  run_module slow
-  run_module disk
-  run_module network
-  run_module service
-  run_module baseline
+  run_module reboot || return 1
+  run_module slow || return 1
+  run_module disk || return 1
+  run_module network || return 1
+  run_module service || return 1
+  run_module baseline || return 1
 }
 
 list_modules() {
@@ -799,10 +799,10 @@ main() {
 
   case "$MODE" in
     run)
-      run_module "$REQUESTED_MODULE"
+      run_module "$REQUESTED_MODULE" || exit 1
       ;;
     all)
-      run_all_modules
+      run_all_modules || exit 1
       ;;
     menu)
       if ! menu_choice_tui; then
