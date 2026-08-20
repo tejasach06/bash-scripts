@@ -429,6 +429,7 @@ def extract_vm(
     vmid: int,
     cluster_name: str,
     storage_meta: dict,
+    status: str = "unknown",
 ) -> Optional[dict]:
     """Extract a single VM's inventory. Returns None on skip."""
     try:
@@ -437,11 +438,9 @@ def extract_vm(
         print(f"[warn] Failed to get config for VM {vmid} on {node}: {e}", file=sys.stderr)
         return None
 
-    status = config.get("status", "unknown")
     if status not in ("running", "stopped"):
         # Still try to extract; status will be 'unknown'
         pass
-
     description = config.get("description", "")
     tags = parse_tags(config)
 
@@ -532,7 +531,8 @@ def main() -> int:
             vmid = vm.get("vmid")
             if vmid is None:
                 continue
-            row = extract_vm(client, node, vmid, cluster_name, storage_meta)
+            status = vm.get("status", "unknown")
+            row = extract_vm(client, node, vmid, cluster_name, storage_meta, status=status)
             if row is not None:
                 all_rows.append(row)
             else:
