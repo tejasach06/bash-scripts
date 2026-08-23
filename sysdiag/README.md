@@ -15,9 +15,9 @@ The script is designed for mixed Linux estates: Debian/Ubuntu, RHEL/Rocky/Fedora
 
 ## Safety model
 
-Diagnostics remain read-only. The `harden` module is dry-run by default; use `--apply` explicitly to make changes. Apply mode requires root and edits local security configuration only; package upgrades require the separate `--upgrade-packages` opt-in. The default sudo rule remains `linuxteam ALL=(ALL) NOPASSWD:ALL`.
+Diagnostics remain read-only. The `harden` module is dry-run by default; use `--apply` explicitly to make changes. Apply mode requires root and edits local security configuration only; package upgrades require the separate `--upgrade-packages` opt-in. The `harden` module is excluded from `--all`; running `--all` never mutates system state. The default sudo rule provisions access (`linuxteam ALL=(ALL) NOPASSWD:ALL`); this control provisions access, it does not harden, and it is listed under `--list-controls` for that reason.
 
-It does not:
+Diagnostic modules do not:
 
 - install packages
 - edit configs
@@ -26,8 +26,7 @@ It does not:
 - run intrusive SMART tests
 - reboot or power off the system
 
-It writes evidence only to the selected output directory. Remediation is suggested in text only.
-
+Diagnostic modules write evidence only to the selected output directory. The `harden` module is dry-run by default and mutates system state only when `--apply` is explicitly passed. When `--apply` runs, individual control errors increment the exit code count (`HARDEN_CONTROL_ERRORS`), causing `--apply` to exit with status 1 on command failure, but one control failure does not abort subsequent controls. Dry-run (audit) mode always exits 0; findings are recorded in `hardening-status.tsv` and `summary.json`.
 ## Requirements
 
 Hard requirements:
@@ -83,7 +82,7 @@ sudo ./sysdiag.sh --run harden --apply
 sudo ./sysdiag.sh --run harden --apply --upgrade-packages
 ```
 
-Run all modules:
+Run all diagnostic modules (reboot, slow, disk, network, service, baseline, tools):
 
 ```bash
 ./sysdiag.sh --all
@@ -123,13 +122,12 @@ Default output path:
 
 Each run contains:
 
-```text
 report.md        Human-readable RCA-style report
 summary.json     Machine-readable summary and findings
 metadata.env     Host, distro, kernel, privilege, virtualization, output metadata
 commands.log     Commands executed, exit codes, and durations
+findings.tsv     Structured TSV findings file
 evidence/*.txt   Raw command output files
-```
 
 With `--package`, the script creates:
 
@@ -209,6 +207,25 @@ Collects a broad read-only host baseline: OS, kernel, boot time, CPU, memory, di
 
 Writes available/missing optional tool inventory to the report evidence directory.
 
+### `harden`
+
+Reviews or applies basic Linux security configuration across 15 control IDs (dry-run by default; excluded from `--all`):
+
+- `tmout`: Shell idle timeout enforcement (`TMOUT=900`)
+- `banner`: Login issue banner configuration
+- `ipv6`: Disable IPv6 via sysctl and GRUB (opinionated default; edits GRUB configuration)
+- `packages`: Refresh package metadata and install core dependencies
+- `packages_extra`: Install selected optional hardening packages (guest_agent, fail2ban, logging, firewall)
+- `pwquality`: PAM password quality requirements (`minlen=14`)
+- `user_sudo`: Dedicated admin account and NOPASSWD sudo access (access provisioning policy, not a hardening control)
+- `su_wheel`: Audit PAM restriction for `su` to wheel/sudo group (audit-only check; does not edit PAM)
+- `kernel_sysctl`: ASLR and protected hardlink/symlink sysctl settings
+- `coredump`: Disable system coredumps via systemd (opinionated default; disables crash dumps read by `reboot` module)
+- `auditd`: Audit daemon configuration and CIS rules
+- `timesync`: NTP time synchronization checks and chrony service activation
+- `journald`: Persistent journald storage configuration and size limits
+- `sshd`: SSH daemon security drop-in (`PermitRootLogin no`, `MaxAuthTries 4`)
+- `file_scan`: Bounded search for world-writable and unowned files (audit-only check)
 ## Example report workflow
 
 ```bash
@@ -226,13 +243,12 @@ python3 -m json.tool /tmp/sysdiag-*/summary.json
 
 Quality gates for this script:
 
-```bash
 bash -n sysdiag.sh
 shellcheck sysdiag.sh
 ./sysdiag.sh --selftest
 python3 -m unittest -v test_sysdiag_harden.py
+./container-audit.sh
 ./sysdiag.sh --list
 ./sysdiag.sh --version
 ./sysdiag.sh --run baseline --out /tmp/sysdiag-test-baseline
 python3 -m json.tool /tmp/sysdiag-test-baseline/summary.json >/dev/null
-```
