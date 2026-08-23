@@ -1,9 +1,29 @@
 #!/usr/bin/env bash
 # sysdiag.sh - Distro-agnostic read-only Linux diagnostics and RCA evidence collector.
+#
+# Sections:
+#   1. config & registries
+#   2. usage & CLI
+#   3. core helpers (progress, output, report, run_cmd, findings)
+#   4. diagnostic modules
+#   5. reboot forensics
+#   6. report & bundle writers
+#   7. hardening helpers
+#   8. hardening controls
+#   9. registries & listing
+#  10. menus
+#  11. selftest
+#  12. entrypoint
+#
+# To add a module:  add a row to MODULE_REGISTRY and define module_<id>.
+# To add a control: add a row to HARDEN_CONTROL_REGISTRY and define harden_control_<id>.
 
 set -u
 set -o pipefail
 
+# ============================================================================
+# SECTION: config & registries
+# ============================================================================
 APP_VERSION="0.1.0"
 MODE="menu"
 REQUESTED_MODULE=""
@@ -24,9 +44,28 @@ HARDEN_CURRENT_CONTROL=""
 HARDEN_STATUS_TSV=""
 HARDEN_SCAN_ROOTS="${SYSDIAG_SCAN_ROOTS:-/etc /usr /var /opt /srv /home /root /tmp}"
 HARDEN_FIND_TIMEOUT="${SYSDIAG_FIND_TIMEOUT:-120}"
-HARDEN_CONTROL_IDS="tmout banner ipv6 packages packages_extra pwquality user_sudo su_wheel kernel_sysctl coredump auditd timesync journald sshd file_scan"
+HARDEN_CONTROL_REGISTRY='tmout|Enforce shell idle timeout (TMOUT)
+banner|Set login issue banner
+ipv6|Disable IPv6 in sysctl and GRUB
+packages|Refresh package metadata and install core dependencies
+packages_extra|Install selected optional hardening packages
+pwquality|Configure PAM password quality requirement
+user_sudo|Provision linuxteam admin user with NOPASSWD sudo (site access policy, not a hardening control)
+su_wheel|Audit only: is su restricted to wheel/sudo group
+kernel_sysctl|Apply kernel hardening sysctl tunings
+coredump|Disable system coredumps
+auditd|Configure audit daemon and CIS audit rules
+timesync|Ensure active NTP time synchronization
+journald|Configure persistent journald storage and size limits
+sshd|Apply SSH daemon security hardening
+file_scan|Scan for world-writable and unowned files'
+HARDEN_CONTROL_IDS="$(printf '%s\n' "$HARDEN_CONTROL_REGISTRY" | cut -d'|' -f1 | tr '\n' ' ')"
 HARDEN_INSTALL=""                 # comma list from --install; empty = install nothing
-HARDEN_PACKAGE_IDS="guest_agent fail2ban logging firewall"
+HARDEN_PACKAGE_REGISTRY='guest_agent|qemu-guest-agent (only on kvm/qemu guests)
+fail2ban|fail2ban with an sshd jail
+logging|rsyslog and needrestart
+firewall|ufw/firewalld, default deny incoming, allow detected SSH port'
+HARDEN_PACKAGE_IDS="$(printf '%s\n' "$HARDEN_PACKAGE_REGISTRY" | cut -d'|' -f1 | tr '\n' ' ')"
 
 HOSTNAME_SHORT="$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf 'unknown-host')"
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -47,8 +86,21 @@ REBOOT_VERDICT_BASIS=""
 REBOOT_VERDICT_RULED_OUT=""
 REBOOT_VERDICT_NOT_ASSESSED=""
 
-OPTIONAL_TOOLS="dialog whiptail jq journalctl coredumpctl dmesg last who uptime vmstat mpstat pidstat iostat sar free lscpu lsblk findmnt smartctl lvs vgs pvs systemctl systemd-detect-virt virt-what virsh podman docker ip ss ethtool nstat nft iptables firewall-cmd ufw resolvectl tar top swapon df mount awk sed grep sort uniq head tail date hostname ps"
+OPTIONAL_TOOLS="dialog whiptail jq journalctl coredumpctl dmesg last who uptime vmstat mpstat pidstat iostat sar free lscpu lsblk findmnt smartctl lvs vgs pvs systemctl systemd-detect-virt virt-what virsh podman docker ip ss ethtool nstat nft iptables firewall-cmd ufw resolvectl tar top swapon df mount awk sed grep sort uniq head tail date hostname ps uname"
 
+# id|in_all|description   (order here is the --all run order and the menu order)
+MODULE_REGISTRY='reboot|1|Why did this system reboot/crash?
+slow|1|Why is this VM/server slow?
+disk|1|Why is disk/filesystem unhealthy?
+network|1|Why is network slow/unreachable?
+service|1|Why did a service/container fail?
+baseline|1|Collect full baseline health report
+tools|1|Show optional tool/dependency detection
+harden|0|Review/apply basic Linux hardening (dry-run by default)'
+
+# ============================================================================
+# SECTION: usage & CLI
+# ============================================================================
 usage() {
   cat <<'USAGE'
 Usage: sysdiag.sh [options]
@@ -91,8 +143,43 @@ Safety:
 USAGE
 }
 
+# ============================================================================
+# SECTION: core helpers (progress, output, report, run_cmd, findings)
+# ============================================================================
 have_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+# csv_each <comma-list> <fn> -> calls <fn> once per non-empty field; first non-zero rc wins
+csv_each() {
+  local list fn field rc old_ifs
+  list="$1"; fn="$2"; rc=0; old_ifs="$IFS"
+  IFS=','
+  for field in $list; do
+    [ -n "$field" ] || continue
+    IFS="$old_ifs"
+    "$fn" "$field" || rc=$?
+    IFS=','
+  done
+  IFS="$old_ifs"
+  return "$rc"
+}
+
+# registry_row <registry> <id> -> prints the matching row, rc 1 if absent
+registry_row() {
+  local reg id row
+  reg="$1"; id="$2"
+  while IFS= read -r row; do
+    case "$row" in "$id|"*) printf '%s\n' "$row"; return 0 ;; esac
+  done <<EOF
+$reg
+EOF
+  return 1
+}
+
+# registry_field <registry> <id> <n> -> prints field n of the matching row
+registry_field() {
+  registry_row "$1" "$2" | cut -d'|' -f"$3"
 }
 PROGRESS_QUIET=0
 PROGRESS_STEP=0
@@ -299,6 +386,14 @@ run_cmd() {
   return 0
 }
 
+# try_cmd <label> <cmd> [args...] -> run via run_cmd when available, else skip
+try_cmd() {
+  local label
+  label="$1"; shift
+  have_cmd "$1" || return 0
+  run_cmd "$label" "$@"
+}
+
 run_shell() {
   # run_shell tag shell-string
   local tag shellcmd safe_tag outfile start end rc
@@ -340,6 +435,9 @@ missing_tool_note() {
   add_finding "info" "high" "Optional tool unavailable: $1" "tool-detection" "Install or enable $1 only if deeper diagnostics are needed; script continued with fallbacks."
 }
 
+# ============================================================================
+# SECTION: diagnostic modules
+# ============================================================================
 section() {
   append_report ""
   append_report "## $1"
@@ -347,24 +445,24 @@ section() {
 }
 
 probe_common_baseline() {
-  have_cmd uname && run_cmd baseline-uname uname -a
-  have_cmd uptime && run_cmd baseline-uptime uptime
-  have_cmd who && run_cmd baseline-who-boot who -b
-  have_cmd free && run_cmd baseline-free free -h
+  try_cmd baseline-uname uname -a
+  try_cmd baseline-uptime uptime
+  try_cmd baseline-who-boot who -b
+  try_cmd baseline-free free -h
   [ -r /proc/meminfo ] && run_cmd baseline-proc-meminfo cat /proc/meminfo
   [ -r /proc/loadavg ] && run_cmd baseline-proc-loadavg cat /proc/loadavg
   [ -r /proc/pressure/cpu ] && run_cmd baseline-psi-cpu cat /proc/pressure/cpu
   [ -r /proc/pressure/memory ] && run_cmd baseline-psi-memory cat /proc/pressure/memory
   [ -r /proc/pressure/io ] && run_cmd baseline-psi-io cat /proc/pressure/io
-  have_cmd lscpu && run_cmd baseline-lscpu lscpu
-  have_cmd lsblk && run_cmd baseline-lsblk lsblk -o NAME,MAJ:MIN,RM,SIZE,RO,TYPE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL
-  have_cmd df && run_cmd baseline-df-h df -hT
-  have_cmd df && run_cmd baseline-df-ih df -ih
-  have_cmd ip && run_cmd baseline-ip-addr ip addr show
-  have_cmd ip && run_cmd baseline-ip-route ip route show table all
-  have_cmd ss && run_cmd baseline-ss-listen ss -tulpen
-  have_cmd ps && run_cmd baseline-ps-top-cpu ps -eo pid,ppid,stat,pcpu,pmem,comm,args --sort=-pcpu
-  have_cmd ps && run_cmd baseline-ps-top-mem ps -eo pid,ppid,stat,pcpu,pmem,comm,args --sort=-pmem
+  try_cmd baseline-lscpu lscpu
+  try_cmd baseline-lsblk lsblk -o NAME,MAJ:MIN,RM,SIZE,RO,TYPE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL
+  try_cmd baseline-df-h df -hT
+  try_cmd baseline-df-ih df -ih
+  try_cmd baseline-ip-addr ip addr show
+  try_cmd baseline-ip-route ip route show table all
+  try_cmd baseline-ss-listen ss -tulpen
+  try_cmd baseline-ps-top-cpu ps -eo pid,ppid,stat,pcpu,pmem,comm,args --sort=-pcpu
+  try_cmd baseline-ps-top-mem ps -eo pid,ppid,stat,pcpu,pmem,comm,args --sort=-pmem
 }
 
 analyze_file_patterns() {
@@ -424,9 +522,9 @@ module_reboot() {
   record_module reboot
   progress_scope reboot
   section "Reboot / Crash Investigation"
-  have_cmd uptime && run_cmd reboot-uptime uptime
-  have_cmd who && run_cmd reboot-who-boot who -b
-  have_cmd last && run_cmd reboot-last-x last -x reboot shutdown -n 20
+  try_cmd reboot-uptime uptime
+  try_cmd reboot-who-boot who -b
+  try_cmd reboot-last-x last -x reboot shutdown -n 20
   if have_cmd journalctl; then
     run_cmd reboot-journal-boots journalctl --list-boots --no-pager
     run_cmd reboot-journal-prev journalctl -b -1 --no-pager
@@ -440,8 +538,8 @@ module_reboot() {
       [ -r "$f" ] && run_cmd "reboot-log-$(basename "$f")" tail -n 500 "$f"
     done
   fi
-  have_cmd dmesg && run_cmd reboot-dmesg-current dmesg -T
-  have_cmd coredumpctl && run_cmd reboot-coredumpctl-list coredumpctl list --no-pager
+  try_cmd reboot-dmesg-current dmesg -T
+  try_cmd reboot-coredumpctl-list coredumpctl list --no-pager
   # shellcheck disable=SC2016
   run_shell reboot-crash-paths 'printf "Crash-related paths:\n"; for d in /var/crash /var/lib/systemd/coredump /var/lib/kdump /var/spool/kdump; do [ -e "$d" ] && ls -lah "$d"; done'
   local init_rc
@@ -460,7 +558,7 @@ module_reboot() {
   # shellcheck disable=SC2016
   run_shell reboot-auth-tail 'for f in /var/log/auth.log /var/log/secure; do [ -r "$f" ] && { echo "### $f"; tail -n 200 "$f"; }; done'
   if [ ! -r /var/log/auth.log ] && [ ! -r /var/log/secure ]; then
-    have_cmd journalctl && run_cmd reboot-auth-journal journalctl -b -1 --no-pager -t sudo -t sshd -t su
+    try_cmd reboot-auth-journal journalctl -b -1 --no-pager -t sudo -t sshd -t su
   fi
   # shellcheck disable=SC2016
   run_shell reboot-pkg-history 'if [ -r /var/log/dpkg.log ]; then tail -n 200 /var/log/dpkg.log; fi; for f in /var/log/dpkg.log.1; do [ -r "$f" ] && tail -n 100 "$f"; done; command -v dnf >/dev/null && dnf history list --reverse 2>&1 | tail -n 40; command -v yum >/dev/null && yum history list 2>&1 | tail -n 40; command -v zypper >/dev/null && zypper --no-refresh search --installed-only --type package >/dev/null 2>&1; [ -r /var/log/zypp/history ] && tail -n 100 /var/log/zypp/history'
@@ -468,7 +566,7 @@ module_reboot() {
   run_shell reboot-auto-update 'for f in /var/log/unattended-upgrades/unattended-upgrades.log /var/log/unattended-upgrades/unattended-upgrades-shutdown.log /var/log/dnf-automatic.log; do [ -r "$f" ] && { echo "### $f"; tail -n 120 "$f"; }; done; for f in /var/run/reboot-required /var/run/reboot-required.pkgs /run/reboot-required /run/reboot-required.pkgs; do [ -e "$f" ] && { echo "### $f"; cat "$f"; }; done; command -v needs-restarting >/dev/null && needs-restarting -r 2>&1'
   # shellcheck disable=SC2016
   run_shell reboot-kernel-installed 'uname -r; ls -lt --time-style=long-iso /boot/vmlinuz-* 2>/dev/null | head -n 10'
-  have_cmd systemctl && run_cmd reboot-timers systemctl list-timers --all --no-pager
+  try_cmd reboot-timers systemctl list-timers --all --no-pager
   # shellcheck disable=SC2016
   run_shell reboot-scheduled-jobs '[ -e /run/systemd/shutdown/scheduled ] && { echo "### /run/systemd/shutdown/scheduled"; cat /run/systemd/shutdown/scheduled; }; command -v atq >/dev/null && { echo "### atq"; atq 2>&1; }; for f in /etc/crontab /var/spool/cron/crontabs/root /var/spool/cron/root; do [ -r "$f" ] && { echo "### $f"; grep -Ei "reboot|shutdown|halt" "$f"; }; done; ls /etc/cron.d 2>/dev/null | while read -r c; do grep -liE "reboot|shutdown" "/etc/cron.d/$c" 2>/dev/null; done'
   # shellcheck disable=SC2016
@@ -487,6 +585,9 @@ module_reboot() {
   reboot_verdict
 }
 
+# ============================================================================
+# SECTION: reboot forensics
+# ============================================================================
 reboot_verdict() {
   REBOOT_VERDICT=""
   REBOOT_VERDICT_CONFIDENCE=""
@@ -801,13 +902,13 @@ module_slow() {
   progress_scope slow
   section "Slow VM / Server Investigation"
   probe_common_baseline
-  have_cmd vmstat && run_cmd slow-vmstat vmstat 1 5
-  have_cmd mpstat && run_cmd slow-mpstat mpstat 1 5
-  have_cmd pidstat && run_cmd slow-pidstat pidstat 1 5
-  have_cmd iostat && run_cmd slow-iostat iostat -xz 1 5
-  have_cmd sar && run_cmd slow-sar-cpu sar -u 1 5
-  have_cmd swapon && run_cmd slow-swapon swapon --show
-  have_cmd top && run_cmd slow-top-batch top -b -n 1
+  try_cmd slow-vmstat vmstat 1 5
+  try_cmd slow-mpstat mpstat 1 5
+  try_cmd slow-pidstat pidstat 1 5
+  try_cmd slow-iostat iostat -xz 1 5
+  try_cmd slow-sar-cpu sar -u 1 5
+  try_cmd slow-swapon swapon --show
+  try_cmd slow-top-batch top -b -n 1
   if [ -r /proc/stat ]; then
     run_shell slow-proc-stat-sample 'awk "/^cpu /{print}" /proc/stat; sleep 1; awk "/^cpu /{print}" /proc/stat'
   fi
@@ -829,15 +930,15 @@ module_disk() {
   record_module disk
   progress_scope disk
   section "Disk / Filesystem Investigation"
-  have_cmd df && run_cmd disk-df-h df -hT
-  have_cmd df && run_cmd disk-df-ih df -ih
-  have_cmd lsblk && run_cmd disk-lsblk lsblk -o NAME,MAJ:MIN,RM,SIZE,RO,TYPE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL
-  have_cmd findmnt && run_cmd disk-findmnt findmnt -A
-  have_cmd mount && run_cmd disk-mount mount
+  try_cmd disk-df-h df -hT
+  try_cmd disk-df-ih df -ih
+  try_cmd disk-lsblk lsblk -o NAME,MAJ:MIN,RM,SIZE,RO,TYPE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL
+  try_cmd disk-findmnt findmnt -A
+  try_cmd disk-mount mount
   [ -r /proc/mdstat ] && run_cmd disk-mdstat cat /proc/mdstat
-  have_cmd lvs && run_cmd disk-lvs lvs -a -o +devices,seg_monitor
-  have_cmd vgs && run_cmd disk-vgs vgs -o +vg_free,vg_extent_size
-  have_cmd pvs && run_cmd disk-pvs pvs -o +pv_used
+  try_cmd disk-lvs lvs -a -o +devices,seg_monitor
+  try_cmd disk-vgs vgs -o +vg_free,vg_extent_size
+  try_cmd disk-pvs pvs -o +pv_used
   if have_cmd journalctl; then
     run_cmd disk-journal-kernel journalctl -k -p warning..alert -n 500 --no-pager
     analyze_file_patterns "$EVIDENCE_DIR/disk-journal-kernel.txt" "kernel storage journal"
@@ -867,26 +968,26 @@ module_network() {
   record_module network
   progress_scope network
   section "Network Investigation"
-  have_cmd ip && run_cmd network-ip-addr ip addr show
-  have_cmd ip && run_cmd network-ip-route ip route show table all
+  try_cmd network-ip-addr ip addr show
+  try_cmd network-ip-route ip route show table all
   if have_cmd resolvectl; then
     run_cmd network-resolvectl resolvectl status
   elif [ -r /etc/resolv.conf ]; then
     run_cmd network-resolv-conf cat /etc/resolv.conf
   fi
-  have_cmd ss && run_cmd network-ss-listen ss -tulpen
-  have_cmd ip && run_cmd network-ip-stats ip -s link
-  have_cmd nstat && run_cmd network-nstat nstat -az
+  try_cmd network-ss-listen ss -tulpen
+  try_cmd network-ip-stats ip -s link
+  try_cmd network-nstat nstat -az
   if have_cmd ethtool && have_cmd ip; then
     # shellcheck disable=SC2016
     run_shell network-ethtool 'for i in $(ip -o link show | awk -F": " "{print \$2}" | grep -v lo); do echo "### $i"; ethtool "$i" 2>&1; ethtool -S "$i" 2>&1 | head -n 80; done'
   else
     have_cmd ethtool || missing_tool_note ethtool
   fi
-  have_cmd nft && run_cmd network-nft nft list ruleset
-  have_cmd iptables && run_cmd network-iptables iptables -S
-  have_cmd firewall-cmd && run_cmd network-firewalld firewall-cmd --state
-  have_cmd ufw && run_cmd network-ufw ufw status verbose
+  try_cmd network-nft nft list ruleset
+  try_cmd network-iptables iptables -S
+  try_cmd network-firewalld firewall-cmd --state
+  try_cmd network-ufw ufw status verbose
   if have_cmd ip && ! ip route show default 2>/dev/null | grep -q '^default'; then
     add_finding "critical" "high" "No default IPv4 route detected" "network-ip-route.txt" "Add/restore default gateway or check DHCP/static routing configuration."
   fi
@@ -981,6 +1082,9 @@ json_array_from_words() {
   done
 }
 
+# ============================================================================
+# SECTION: report & bundle writers
+# ============================================================================
 write_summary_json() {
   local end_epoch duration modules_json available_json missing_json findings_json first sev conf title evidence rec item
   local ruled_out_json not_assessed_json reboot_verdict_json
@@ -992,7 +1096,7 @@ write_summary_json() {
   findings_json=""
   if [ -s "$FINDINGS_TSV" ]; then
     first=1
-    while IFS="$(printf '\t')" read -r sev conf title evidence rec; do
+    while IFS=$'\t' read -r sev conf title evidence rec; do
       [ -n "$sev" ] || continue
       item="    {\"severity\":\"$(json_escape "$sev")\",\"confidence\":\"$(json_escape "$conf")\",\"title\":\"$(json_escape "$title")\",\"evidence\":\"$(json_escape "$evidence")\",\"recommendation\":\"$(json_escape "$rec")\"}"
       if [ "$first" -eq 1 ]; then
@@ -1167,6 +1271,9 @@ build_bundle() {
   printf '%s\n' "$bundle_file"
 }
 
+# ============================================================================
+# SECTION: hardening helpers
+# ============================================================================
 harden_log() {
   printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf unknown)" "$1" "$2" >> "$EVIDENCE_DIR/hardening-actions.tsv"
 }
@@ -1191,14 +1298,25 @@ harden_status() {
   esac
 }
 
+# harden_check <id> <pass-detail> <fail-detail> <cmd...> -> status PASS if cmd succeeds
+harden_check() {
+  local id pass_detail fail_detail
+  id="$1"; pass_detail="$2"; fail_detail="$3"; shift 3
+  if "$@"; then
+    harden_status "$id" PASS "$pass_detail"
+  else
+    harden_status "$id" FAIL "$fail_detail"
+  fi
+}
+
 harden_package_description() {
-  case "$1" in
-    guest_agent) printf 'qemu-guest-agent (only on kvm/qemu guests)' ;;
-    fail2ban)    printf 'fail2ban with an sshd jail' ;;
-    logging)     printf 'rsyslog and needrestart' ;;
-    firewall)    printf 'ufw/firewalld, default deny incoming, allow detected SSH port' ;;
-    *)           printf 'Unknown package group' ;;
-  esac
+  local desc
+  desc="$(registry_field "$HARDEN_PACKAGE_REGISTRY" "$1" 2)"
+  if [ -n "$desc" ]; then
+    printf '%s' "$desc"
+  else
+    printf 'Unknown package group'
+  fi
 }
 
 harden_package_names() {
@@ -1401,12 +1519,12 @@ harden_configure_grub() {
   fi
   harden_update_grub_default || return 1
   if have_cmd update-grub; then
-    harden_run_cmd 'regenerate GRUB configuration' update-grub
+    harden_run_cmd 'regenerate GRUB configuration' update-grub || return 1
   elif have_cmd grub2-mkconfig; then
     if [ -d /boot/grub2 ]; then
-      harden_run_cmd 'regenerate GRUB configuration' grub2-mkconfig -o /boot/grub2/grub.cfg
+      harden_run_cmd 'regenerate GRUB configuration' grub2-mkconfig -o /boot/grub2/grub.cfg || return 1
     elif [ -d /boot/grub ]; then
-      harden_run_cmd 'regenerate GRUB configuration' grub2-mkconfig -o /boot/grub/grub.cfg
+      harden_run_cmd 'regenerate GRUB configuration' grub2-mkconfig -o /boot/grub/grub.cfg || return 1
     else
       harden_plan 'skip GRUB regeneration; no known grub config directory found'
     fi
@@ -1458,7 +1576,7 @@ retry = 3' || return 1
 
 harden_user_sudo() {
   local password hash tmp sudoers_file
-  password=""; hash=""; sudoers_file=/etc/sudoers.d/90-sysdiag-linuxteam
+  password=""; hash=""; sudoers_file="/etc/sudoers.d/90-sysdiag-$HARDEN_USER"
   harden_plan "create/update $HARDEN_USER and preserve NOPASSWD sudo default"
   [ "$HARDEN_APPLY" -eq 1 ] || return 0
   printf 'WARNING: NOPASSWD:ALL grants %s unrestricted root access when applied.\n' "$HARDEN_USER" >&2
@@ -1480,35 +1598,30 @@ harden_user_sudo() {
   harden_log changed "$sudoers_file"
 }
 
+# ============================================================================
+# SECTION: hardening controls
+# ============================================================================
 harden_control_tmout() {
   harden_write_file /etc/profile.d/99-sysdiag-timeout.sh 0644 "TMOUT=$HARDEN_TMOUT
 readonly TMOUT
 export TMOUT" || return 1
-  if [ -r /etc/profile.d/99-sysdiag-timeout.sh ] && grep -q "TMOUT=$HARDEN_TMOUT" /etc/profile.d/99-sysdiag-timeout.sh 2>/dev/null; then
-    harden_status tmout PASS "TMOUT=$HARDEN_TMOUT configured"
-  else
-    harden_status tmout FAIL "TMOUT=$HARDEN_TMOUT not set"
-  fi
+  harden_check tmout "TMOUT=$HARDEN_TMOUT configured" "TMOUT=$HARDEN_TMOUT not set" grep -q -s "TMOUT=$HARDEN_TMOUT" /etc/profile.d/99-sysdiag-timeout.sh
 }
+
+_banner_ok() { cmp -s /etc/issue /etc/issue.net 2>/dev/null && [ -s /etc/issue ]; }
 
 harden_control_banner() {
   harden_write_file /etc/issue 0644 "$HARDEN_BANNER" || return 1
   harden_write_file /etc/issue.net 0644 "$HARDEN_BANNER" || return 1
-  if cmp -s /etc/issue /etc/issue.net 2>/dev/null && [ -s /etc/issue ]; then
-    harden_status banner PASS "banner updated in /etc/issue and /etc/issue.net"
-  else
-    harden_status banner FAIL "issue banners missing or mismatch"
-  fi
+  harden_check banner "banner updated in /etc/issue and /etc/issue.net" "issue banners missing or mismatch" _banner_ok
 }
+
+_ipv6_off() { [ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" = "1" ]; }
 
 harden_control_ipv6() {
   harden_configure_sysctl || return 1
   harden_configure_grub || return 1
-  if [ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" = "1" ]; then
-    harden_status ipv6 PASS "net.ipv6.conf.all.disable_ipv6 = 1"
-  else
-    harden_status ipv6 FAIL "IPv6 active in sysctl"
-  fi
+  harden_check ipv6 "net.ipv6.conf.all.disable_ipv6 = 1" "IPv6 active in sysctl" _ipv6_off
 }
 
 harden_control_packages() {
@@ -1519,16 +1632,9 @@ harden_control_packages() {
 harden_control_packages_extra() {
   local selected pkg names missing_names pkg_installed p ports s_port
   selected=""
-  if [ -n "$HARDEN_INSTALL" ]; then
-    local old_ifs="$IFS"
-    IFS=','
-    for pkg in $HARDEN_INSTALL; do
-      case " $HARDEN_PACKAGE_IDS " in
-        *" $pkg "*) selected="$selected $pkg" ;;
-      esac
-    done
-    IFS="$old_ifs"
-  fi
+  # shellcheck disable=SC2317
+  _collect_pkg() { case " $HARDEN_PACKAGE_IDS " in *" $1 "*) selected="$selected $1" ;; esac; }
+  [ -z "$HARDEN_INSTALL" ] || csv_each "$HARDEN_INSTALL" _collect_pkg
 
   if [ -z "$selected" ]; then
     local present="" absent=""
@@ -1703,21 +1809,15 @@ harden_control_pwquality() {
   fi
 }
 
+_user_sudo_ok() { id "$HARDEN_USER" >/dev/null 2>&1 && [ -r "/etc/sudoers.d/90-sysdiag-$HARDEN_USER" ]; }
+
 harden_control_user_sudo() {
   harden_user_sudo || return 1
-  if id "$HARDEN_USER" >/dev/null 2>&1 && [ -r "/etc/sudoers.d/90-sysdiag-$HARDEN_USER" ]; then
-    harden_status user_sudo PASS "user $HARDEN_USER present with NOPASSWD:ALL sudo (site access policy)"
-  else
-    harden_status user_sudo FAIL "user $HARDEN_USER or sudo file missing"
-  fi
+  harden_check user_sudo "user $HARDEN_USER present with NOPASSWD:ALL sudo (site access policy)" "user $HARDEN_USER or sudo file missing" _user_sudo_ok
 }
 
 harden_control_su_wheel() {
-  if [ -r /etc/pam.d/su ] && grep -Eq 'pam_wheel.so' /etc/pam.d/su 2>/dev/null; then
-    harden_status su_wheel PASS "su restricted to wheel group"
-  else
-    harden_status su_wheel FAIL "su pam_wheel restriction missing"
-  fi
+  harden_check su_wheel "su restricted to wheel group" "su pam_wheel restriction missing" grep -Eq -s 'pam_wheel.so' /etc/pam.d/su
 }
 
 harden_control_kernel_sysctl() {
@@ -2086,130 +2186,108 @@ module_harden() {
   return 0
 }
 
+# ============================================================================
+# SECTION: registries & listing
+# ============================================================================
 run_module() {
-  case "$1" in
-    baseline) module_baseline ;;
-    reboot) module_reboot ;;
-    slow) module_slow ;;
-    disk) module_disk ;;
-    network) module_network ;;
-    service) module_service ;;
-    tools) module_tools ;;
-    harden) module_harden ;;
-    *) printf 'Unknown module: %s\n' "$1" >&2; return 1 ;;
-  esac
+  if registry_row "$MODULE_REGISTRY" "$1" >/dev/null; then
+    "module_$1"
+  else
+    printf 'Unknown module: %s\n' "$1" >&2
+    return 1
+  fi
 }
 
 run_all_modules() {
-  run_module reboot || return 1
-  run_module slow || return 1
-  run_module disk || return 1
-  run_module network || return 1
-  run_module service || return 1
-  run_module baseline || return 1
-  run_module tools || return 1
+  local id in_all desc
+  while IFS='|' read -r id in_all desc; do
+    [ -n "$id" ] || continue
+    [ "$in_all" -eq 1 ] || continue
+    run_module "$id" || return 1
+  done <<EOF
+$MODULE_REGISTRY
+EOF
 }
 
 list_modules() {
-  cat <<'EOF_LIST'
-Available modules:
-  reboot    Why did this system reboot/crash?
-  slow      Why is this VM/server slow?
-  disk      Why is disk/filesystem unhealthy?
-  network   Why is network slow/unreachable?
-  service   Why did a service/container fail?
-  baseline  Collect full baseline health report
-  tools     Show optional tool/dependency detection
-  harden    Review/apply basic Linux hardening (dry-run by default)
-EOF_LIST
+  local id in_all desc
+  printf 'Available modules:\n'
+  while IFS='|' read -r id in_all desc; do
+    [ -n "$id" ] || continue
+    printf '  %-9s %s\n' "$id" "$desc"
+  done <<EOF
+$MODULE_REGISTRY
+EOF
 }
 
 list_controls() {
   local id desc
-  for id in $HARDEN_CONTROL_IDS; do
-    case "$id" in
-      tmout) desc="Enforce shell idle timeout (TMOUT)" ;;
-      banner) desc="Set login issue banner" ;;
-      ipv6) desc="Disable IPv6 in sysctl and GRUB" ;;
-      packages) desc="Refresh package metadata and install core dependencies" ;;
-      packages_extra) desc="Install selected optional hardening packages" ;;
-      pwquality) desc="Configure PAM password quality requirement" ;;
-      user_sudo) desc="Provision linuxteam admin user with NOPASSWD sudo (site access policy, not a hardening control)" ;;
-      su_wheel) desc="Audit only: is su restricted to wheel/sudo group" ;;
-      kernel_sysctl) desc="Apply kernel hardening sysctl tunings" ;;
-      coredump) desc="Disable system coredumps" ;;
-      auditd) desc="Configure audit daemon and CIS audit rules" ;;
-      timesync) desc="Ensure active NTP time synchronization" ;;
-      journald) desc="Configure persistent journald storage and size limits" ;;
-      sshd) desc="Apply SSH daemon security hardening" ;;
-      file_scan) desc="Scan for world-writable and unowned files" ;;
-      *) desc="Hardening control $id" ;;
-    esac
+  while IFS='|' read -r id desc; do
+    [ -n "$id" ] || continue
     printf '%s\t%s\n' "$id" "$desc"
-  done
+  done <<EOF
+$HARDEN_CONTROL_REGISTRY
+EOF
 }
 
 list_packages() {
-  local id
-  for id in $HARDEN_PACKAGE_IDS; do
-    printf '%s\t%s\n' "$id" "$(harden_package_description "$id")"
-  done
+  local id desc
+  while IFS='|' read -r id desc; do
+    [ -n "$id" ] || continue
+    printf '%s\t%s\n' "$id" "$desc"
+  done <<EOF
+$HARDEN_PACKAGE_REGISTRY
+EOF
+}
+
+_validate_control_name() {
+  case " $HARDEN_CONTROL_IDS " in
+    *" $1 "*) return 0 ;;
+    *)
+      printf 'ERROR: unknown hardening control: %s\n' "$1" >&2
+      return 2
+      ;;
+  esac
 }
 
 harden_validate_control_names() {
   [ -n "$HARDEN_CONTROLS" ] || return 0
-  local ctrl
-  local old_ifs="$IFS"
-  IFS=','
-  for ctrl in $HARDEN_CONTROLS; do
-    case " $HARDEN_CONTROL_IDS " in
-      *" $ctrl "*) ;;
-      *)
-        IFS="$old_ifs"
-        printf 'ERROR: unknown hardening control: %s\n' "$ctrl" >&2
-        return 2
-        ;;
-    esac
-  done
-  IFS="$old_ifs"
-  return 0
+  csv_each "$HARDEN_CONTROLS" _validate_control_name
+}
+
+_validate_package_name() {
+  case " $HARDEN_PACKAGE_IDS " in
+    *" $1 "*) return 0 ;;
+    *)
+      printf 'ERROR: unknown package group: %s\n' "$1" >&2
+      return 2
+      ;;
+  esac
 }
 
 harden_validate_package_names() {
   [ -n "$HARDEN_INSTALL" ] || return 0
-  local pkg
-  local old_ifs="$IFS"
-  IFS=','
-  for pkg in $HARDEN_INSTALL; do
-    case " $HARDEN_PACKAGE_IDS " in
-      *" $pkg "*) ;;
-      *)
-        IFS="$old_ifs"
-        printf 'ERROR: unknown package group: %s\n' "$pkg" >&2
-        return 2
-        ;;
-    esac
-  done
-  IFS="$old_ifs"
-  return 0
+  csv_each "$HARDEN_INSTALL" _validate_package_name
 }
 
+# ============================================================================
+# SECTION: menus
+# ============================================================================
 menu_choice_plain() {
+  local id in_all desc num choice mod_id input_pkgs
   while true; do
+    printf '\nsysdiag - read-only Linux diagnostics\n\n'
+    num=0
+    while IFS='|' read -r id in_all desc; do
+      [ -n "$id" ] || continue
+      num=$((num + 1))
+      printf '%d) %s\n' "$num" "$desc"
+    done <<EOF
+$MODULE_REGISTRY
+EOF
     cat <<'MENU'
-
-sysdiag - read-only Linux diagnostics
-
-1) Why did this system reboot/crash?
-2) Why is this VM/server slow?
-3) Why is disk/filesystem unhealthy?
-4) Why is network slow/unreachable?
-5) Why did a service/container fail?
-6) Collect full baseline health report
-7) Show tool/dependency detection
-8) Run all modules
-9) Package current run as tarball
-10) Review/apply basic Linux hardening
+9) Run all modules
+10) Package current run as tarball
 11) Select packages to install with hardening
 12) Build single-file AI handoff bundle
 0) Quit
@@ -2217,23 +2295,42 @@ MENU
     printf 'Select: '
     read -r choice || return 0
     case "$choice" in
-      1) run_module reboot ;;
-      2) run_module slow ;;
-      3) run_module disk ;;
-      4) run_module network ;;
-      5) run_module service ;;
-      6) run_module baseline ;;
-      7) run_module tools ;;
-      8) run_all_modules ;;
-      9) package_run || true ;;
-      12) build_bundle || true ;;
+      [1-8])
+        num=0
+        mod_id=""
+        while IFS='|' read -r id in_all desc; do
+          [ -n "$id" ] || continue
+          num=$((num + 1))
+          if [ "$num" -eq "$choice" ]; then
+            mod_id="$id"
+            break
+          fi
+        done <<EOF
+$MODULE_REGISTRY
+EOF
+        [ -n "$mod_id" ] && run_module "$mod_id"
+        ;;
+      9) run_all_modules ;;
+      10) package_run || true ;;
       11)
-        printf 'Available package groups: guest_agent, fail2ban, logging, firewall\n'
+        local pkg_list="" pkg_id pkg_desc
+        while IFS='|' read -r pkg_id pkg_desc; do
+          [ -n "$pkg_id" ] || continue
+          if [ -z "$pkg_list" ]; then
+            pkg_list="$pkg_id"
+          else
+            pkg_list="$pkg_list, $pkg_id"
+          fi
+        done <<EOF
+$HARDEN_PACKAGE_REGISTRY
+EOF
+        printf 'Available package groups: %s\n' "$pkg_list"
         printf 'Enter comma-separated groups (current: %s): ' "$HARDEN_INSTALL"
         read -r input_pkgs
         HARDEN_INSTALL="$input_pkgs"
         harden_validate_package_names || HARDEN_INSTALL=""
         ;;
+      12) build_bundle || true ;;
       0|q|Q) return 0 ;;
       *) printf 'Invalid choice\n' ;;
     esac
@@ -2242,7 +2339,8 @@ MENU
 }
 
 menu_choice_tui() {
-  local ui choice sel
+  local ui choice sel id in_all desc num mod_id
+  local menu_items=()
   if have_cmd dialog; then
     ui="dialog"
   elif have_cmd whiptail; then
@@ -2251,45 +2349,67 @@ menu_choice_tui() {
     return 1
   fi
   while true; do
-    choice="$($ui --title 'sysdiag' --menu 'Read-only Linux diagnostics' 20 78 12 \
-      1 'Why did this system reboot/crash?' \
-      2 'Why is this VM/server slow?' \
-      3 'Why is disk/filesystem unhealthy?' \
-      4 'Why is network slow/unreachable?' \
-      5 'Why did a service/container fail?' \
-      6 'Collect full baseline health report' \
-      7 'Show tool/dependency detection' \
-      8 'Run all modules' \
-      9 'Package current run as tarball' \
-      10 'Review/apply basic hardening' \
-      11 'Select packages to install with hardening' \
-      12 'Build single-file AI handoff bundle' \
-      0 'Quit' 3>&1 1>&2 2>&3)" || return 0
+    menu_items=()
+    num=0
+    while IFS='|' read -r id in_all desc; do
+      [ -n "$id" ] || continue
+      num=$((num + 1))
+      menu_items+=("$num" "$desc")
+    done <<EOF
+$MODULE_REGISTRY
+EOF
+    menu_items+=(
+      9 "Run all modules"
+      10 "Package current run as tarball"
+      11 "Select packages to install with hardening"
+      12 "Build single-file AI handoff bundle"
+      0 "Quit"
+    )
+    choice="$($ui --title 'sysdiag' --menu 'Read-only Linux diagnostics' 20 78 13 \
+      "${menu_items[@]}" 3>&1 1>&2 2>&3)" || return 0
     case "$choice" in
-      1) run_module reboot ;;
-      2) run_module slow ;;
-      3) run_module disk ;;
-      4) run_module network ;;
-      5) run_module service ;;
-      6) run_module baseline ;;
-      7) run_module tools ;;
-      8) run_all_modules ;;
-      9) package_run || true ;;
-      12) build_bundle || true ;;
-      10) run_module harden ;;
+      [1-8])
+        num=0
+        mod_id=""
+        while IFS='|' read -r id in_all desc; do
+          [ -n "$id" ] || continue
+          num=$((num + 1))
+          if [ "$num" -eq "$choice" ]; then
+            mod_id="$id"
+            break
+          fi
+        done <<EOF
+$MODULE_REGISTRY
+EOF
+        [ -n "$mod_id" ] && run_module "$mod_id"
+        ;;
+      9) run_all_modules ;;
+      10) package_run || true ;;
       11)
+        local checklist_items=() pkg_id pkg_desc def_state
+        while IFS='|' read -r pkg_id pkg_desc; do
+          [ -n "$pkg_id" ] || continue
+          case "$pkg_id" in
+            fail2ban|logging) def_state="on" ;;
+            *) def_state="off" ;;
+          esac
+          checklist_items+=("$pkg_id" "$pkg_desc" "$def_state")
+        done <<EOF
+$HARDEN_PACKAGE_REGISTRY
+EOF
         sel="$($ui --title 'sysdiag' --checklist 'Select package groups' 20 78 8 \
-          guest_agent "$(harden_package_description guest_agent)" off \
-          fail2ban "$(harden_package_description fail2ban)" on \
-          logging "$(harden_package_description logging)" on \
-          firewall "$(harden_package_description firewall)" off 3>&1 1>&2 2>&3)" || true
+          "${checklist_items[@]}" 3>&1 1>&2 2>&3)" || true
         HARDEN_INSTALL="$(printf '%s' "$sel" | tr -d '"' | tr ' ' ',')"
         ;;
+      12) build_bundle || true ;;
       0) return 0 ;;
     esac
   done
 }
 
+# ============================================================================
+# SECTION: selftest
+# ============================================================================
 selftest() {
   local tmp rc
   tmp="$(mktemp -d 2>/dev/null || printf '/tmp/sysdiag-selftest-%s' "$$")"
@@ -2318,6 +2438,9 @@ selftest() {
   return "$rc"
 }
 
+# ============================================================================
+# SECTION: entrypoint
+# ============================================================================
 parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -2406,7 +2529,9 @@ main() {
   printf 'Report: %s\n' "$REPORT_FILE"
   printf 'Summary: %s\n' "$SUMMARY_FILE"
   printf 'Evidence: %s\n' "$EVIDENCE_DIR"
-  [ "$BUNDLE" -eq 1 ] && [ -f "$OUT_DIR/bundle.md" ] && printf 'Bundle: %s\n' "$OUT_DIR/bundle.md"
+  if [ "$BUNDLE" -eq 1 ] && [ -f "$OUT_DIR/bundle.md" ]; then
+    printf 'Bundle: %s\n' "$OUT_DIR/bundle.md"
+  fi
   if [ "$HARDEN_APPLY" -eq 1 ] && [ "$HARDEN_CONTROL_ERRORS" -gt 0 ]; then
     printf 'ERROR: %s hardening control(s) failed; see %s\n' "$HARDEN_CONTROL_ERRORS" "$HARDEN_STATUS_TSV" >&2
     exit 1
