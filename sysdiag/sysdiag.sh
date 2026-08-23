@@ -9,6 +9,12 @@ MODE="menu"
 REQUESTED_MODULE=""
 OUT_DIR=""
 PACKAGE_ONLY=0
+HARDEN_APPLY=0
+HARDEN_UPGRADE_PACKAGES=0
+HARDEN_ALLOW_VIRTUALIZATION=0
+HARDEN_USER="linuxteam"
+HARDEN_TMOUT=900
+HARDEN_BANNER="Authorized access only. Activity may be monitored and recorded."
 
 HOSTNAME_SHORT="$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf 'unknown-host')"
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -33,7 +39,10 @@ Usage: sysdiag.sh [options]
 Read-only distro-agnostic Linux diagnostics with Markdown/JSON evidence reports.
 
 Options:
-  --run MODULE       Run one module: reboot, slow, disk, network, service, baseline, tools
+  --run MODULE       Run one module: reboot, slow, disk, network, service, baseline, tools, harden
+  --apply            Apply changes for harden (default is dry-run)
+  --upgrade-packages Allow harden to upgrade installed packages in apply mode
+  --allow-virtualization Permit apply mode in detected VM/container environments
   --all              Run all modules
   --list             List modules and exit
   --out DIR          Write output to DIR (default: ./sysdiag-runs/<host>-<timestamp>)
@@ -627,6 +636,239 @@ package_run() {
   printf '%s\n' "$tarfile"
 }
 
+harden_log() {
+  printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf unknown)" "$1" "$2" >> "$EVIDENCE_DIR/hardening-actions.tsv"
+}
+
+harden_plan() {
+  printf '%s\n' "$1" >> "$EVIDENCE_DIR/hardening-plan.txt"
+  if [ "$HARDEN_APPLY" -eq 1 ]; then
+    printf 'APPLY: %s\n' "$1"
+  else
+    printf 'DRY-RUN: %s\n' "$1"
+  fi
+}
+
+harden_detect() {
+  HARDEN_DISTRO_ID=unknown
+  HARDEN_DISTRO_LIKE=""
+  HARDEN_DISTRO_FAMILY=unknown
+  HARDEN_VIRT=none
+  [ -r /etc/os-release ] && { . /etc/os-release; HARDEN_DISTRO_ID="${ID:-unknown}"; HARDEN_DISTRO_LIKE="${ID_LIKE:-}"; }
+  have_cmd systemd-detect-virt && HARDEN_VIRT="$(systemd-detect-virt 2>/dev/null || printf unknown)"
+  case " $HARDEN_DISTRO_ID $HARDEN_DISTRO_LIKE " in
+    *' debian '*|*' ubuntu '*) HARDEN_DISTRO_FAMILY=debian ;;
+    *' rhel '*|*' fedora '*|*' redhat '*|*' rocky '*|*' almalinux '*|*' centos '*) HARDEN_DISTRO_FAMILY=rhel ;;
+    *' suse '*|*' opensuse '*|*' sles '*) HARDEN_DISTRO_FAMILY=suse ;;
+  esac
+  {
+    printf 'distro_id=%s\n' "$HARDEN_DISTRO_ID"
+    printf 'distro_like=%s\n' "$HARDEN_DISTRO_LIKE"
+    printf 'distro_family=%s\n' "$HARDEN_DISTRO_FAMILY"
+    printf 'virtualization=%s\n' "$HARDEN_VIRT"
+    printf 'mode=%s\n' "$([ "$HARDEN_APPLY" -eq 1 ] && printf apply || printf dry-run)"
+    printf 'upgrade_packages=%s\n' "$HARDEN_UPGRADE_PACKAGES"
+    printf 'allow_virtualization=%s\n' "$HARDEN_ALLOW_VIRTUALIZATION"
+  } | tee "$EVIDENCE_DIR/hardening-environment.txt"
+}
+
+harden_preflight() {
+  local missing rc; missing=""; rc=0
+  if [ "$HARDEN_APPLY" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
+    printf 'ERROR: apply mode requires root. Use sudo ./sysdiag.sh --run harden --apply.\n' >&2
+    rc=1
+  fi
+  if [ "$HARDEN_APPLY" -eq 1 ] && [ "$HARDEN_ALLOW_VIRTUALIZATION" -ne 1 ] && [ "$HARDEN_VIRT" != "none" ] && [ -n "$HARDEN_VIRT" ]; then
+    printf 'ERROR: apply mode refused in virtualization environment (%s); use --allow-virtualization explicitly.\n' "$HARDEN_VIRT" >&2
+    rc=1
+  fi
+  if [ "$HARDEN_APPLY" -eq 1 ]; then
+    for cmd in chpasswd date install mktemp openssl sysctl useradd visudo; do
+      have_cmd "$cmd" || missing="$missing $cmd"
+    done
+    if [ -n "$missing" ]; then
+      printf 'ERROR: apply mode missing required command(s):%s\n' "$missing" >&2
+      rc=1
+    fi
+  fi
+  if [ "$HARDEN_DISTRO_FAMILY" = unknown ]; then
+    printf 'WARNING: unrecognized distribution; PAM/package changes will be skipped.\n' >&2
+    harden_log warning 'unrecognized distribution; PAM/package changes skipped'
+  fi
+  return "$rc"
+}
+
+harden_backup_file() {
+  local file backup
+  file="$1"
+  [ -e "$file" ] || return 0
+  backup="$EVIDENCE_DIR/backups${file}"
+  install -d -m 0700 "$(dirname "$backup")"
+  if [ ! -e "$backup" ]; then
+    cp -a "$file" "$backup"
+    harden_log backup "$file -> $backup"
+  fi
+}
+
+harden_write_file() {
+  local file mode content tmp dir
+  file="$1"; mode="$2"; content="$3"; dir="$(dirname "$file")"
+  harden_plan "write $file"
+  [ "$HARDEN_APPLY" -eq 1 ] || return 0
+  install -d -m 0755 "$dir"
+  harden_backup_file "$file"
+  tmp="$(mktemp "${dir}/.sysdiag.XXXXXX")" || return 1
+  printf '%s\n' "$content" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod "$mode" "$tmp" || { rm -f "$tmp"; return 1; }
+  if [ -e "$file" ] && cmp -s "$tmp" "$file"; then
+    rm -f "$tmp"
+    harden_log unchanged "$file"
+  else
+    mv -f "$tmp" "$file"
+    harden_log changed "$file"
+  fi
+}
+
+harden_run_cmd() {
+  local description; description="$1"; shift
+  harden_plan "$description: $*"
+  [ "$HARDEN_APPLY" -eq 1 ] || return 0
+  "$@"
+  harden_log command "$description"
+}
+
+harden_configure_sysctl() {
+  harden_write_file /etc/sysctl.d/99-sysdiag-ipv6.conf 0644 'net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1' || return 1
+  harden_run_cmd 'load sysctl configuration' sysctl --system || return 1
+  [ "$HARDEN_APPLY" -eq 1 ] || return 0
+  {
+    printf 'net.ipv6.conf.all.disable_ipv6=%s\n' "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || printf missing)"
+    printf 'net.ipv6.conf.default.disable_ipv6=%s\n' "$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || printf missing)"
+  } >> "$EVIDENCE_DIR/hardening-verification.txt"
+  [ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" = 1 ] || return 1
+  [ "$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null)" = 1 ] || return 1
+}
+
+harden_update_grub_default() {
+  local file line current escaped updated
+  file=/etc/default/grub
+  [ -r "$file" ] || { harden_plan 'skip GRUB default update; /etc/default/grub missing'; return 0; }
+  harden_plan 'ensure ipv6.disable=1 in /etc/default/grub'
+  [ "$HARDEN_APPLY" -eq 1 ] || return 0
+  harden_backup_file "$file"
+  current="$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$file" 2>/dev/null || true)"
+  if [ -n "$current" ]; then
+    printf '%s\n' "$current" | grep -q 'ipv6.disable=1' && return 0
+    line="$(printf '%s\n' "$current" | sed 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"$/\1/')"
+    escaped="$(printf '%s' "$line" | sed 's/[\\&|]/\\&/g')"
+    updated="GRUB_CMDLINE_LINUX_DEFAULT=\"ipv6.disable=1 $escaped\""
+    sed "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|$updated|" "$file" > "$file.sysdiag.tmp" || { rm -f "$file.sysdiag.tmp"; return 1; }
+  else
+    cp "$file" "$file.sysdiag.tmp" || return 1
+    printf '%s\n' 'GRUB_CMDLINE_LINUX_DEFAULT="ipv6.disable=1"' >> "$file.sysdiag.tmp"
+  fi
+  mv -f "$file.sysdiag.tmp" "$file"
+  harden_log changed "$file"
+}
+
+harden_configure_grub() {
+  if have_cmd grubby; then
+    harden_run_cmd 'ensure ipv6.disable=1 for all kernels with grubby' grubby --update-kernel=ALL --args=ipv6.disable=1
+    return $?
+  fi
+  harden_update_grub_default || return 1
+  if have_cmd update-grub; then
+    harden_run_cmd 'regenerate GRUB configuration' update-grub
+  elif have_cmd grub2-mkconfig; then
+    if [ -d /boot/grub2 ]; then
+      harden_run_cmd 'regenerate GRUB configuration' grub2-mkconfig -o /boot/grub2/grub.cfg
+    elif [ -d /boot/grub ]; then
+      harden_run_cmd 'regenerate GRUB configuration' grub2-mkconfig -o /boot/grub/grub.cfg
+    else
+      harden_plan 'skip GRUB regeneration; no known grub config directory found'
+    fi
+  else
+    harden_plan 'skip GRUB regeneration; updater command not found'
+  fi
+}
+
+harden_packages() {
+  [ "$HARDEN_DISTRO_FAMILY" != unknown ] || return 0
+  case "$HARDEN_DISTRO_FAMILY" in
+    debian)
+      harden_run_cmd 'refresh Debian-family package metadata' apt-get update || return 1
+      [ "$HARDEN_UPGRADE_PACKAGES" -eq 1 ] && harden_run_cmd 'upgrade Debian-family packages' apt-get -y upgrade
+      harden_run_cmd 'install password policy dependency' apt-get -y install libpam-pwquality ;;
+    rhel)
+      [ "$HARDEN_UPGRADE_PACKAGES" -eq 1 ] && harden_run_cmd 'upgrade RHEL-family packages' dnf -y upgrade
+      harden_run_cmd 'install password policy dependency' dnf -y install libpwquality ;;
+    suse)
+      [ "$HARDEN_UPGRADE_PACKAGES" -eq 1 ] && harden_run_cmd 'upgrade SUSE packages' zypper --non-interactive update
+      harden_run_cmd 'install password policy dependency' zypper --non-interactive install libpwquality-tools ;;
+  esac
+  [ "$HARDEN_UPGRADE_PACKAGES" -eq 1 ] || harden_plan 'skip package upgrades; pass --upgrade-packages to opt in'
+}
+
+harden_pam_policy() {
+  harden_write_file /etc/security/pwquality.conf.d/99-sysdiag.conf 0644 'minlen = 14
+ucredit = -1
+lcredit = -1
+dcredit = -1
+ocredit = -1
+retry = 3' || return 1
+  if have_cmd authselect; then
+    harden_run_cmd 'record authselect current profile' authselect current || return 0
+    harden_plan 'authselect detected; no direct PAM file edits performed'
+  else
+    harden_plan 'PAM policy limited to pwquality drop-in; no direct PAM file edits performed'
+  fi
+}
+
+harden_user_sudo() {
+  local password hash tmp sudoers_file
+  password=""; hash=""; sudoers_file=/etc/sudoers.d/90-sysdiag-linuxteam
+  harden_plan "create/update $HARDEN_USER and preserve NOPASSWD sudo default"
+  [ "$HARDEN_APPLY" -eq 1 ] || return 0
+  printf 'WARNING: NOPASSWD:ALL grants %s unrestricted root access when applied.\n' "$HARDEN_USER" >&2
+  printf 'Password for %s (input hidden): ' "$HARDEN_USER" >&2
+  read -r -s password; printf '\n' >&2
+  [ -n "$password" ] || { printf 'ERROR: empty password rejected.\n' >&2; return 1; }
+  hash="$(printf '%s' "$password" | openssl passwd -6 -stdin 2>/dev/null)" || return 1
+  unset password
+  id "$HARDEN_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$HARDEN_USER"
+  printf '%s:%s\n' "$HARDEN_USER" "$hash" | chpasswd -e
+  install -d -m 0750 /etc/sudoers.d
+  harden_backup_file "$sudoers_file"
+  tmp="$(mktemp /etc/sudoers.d/.sysdiag.XXXXXX)" || return 1
+  printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$HARDEN_USER" > "$tmp"
+  chmod 0440 "$tmp"
+  visudo -cf "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$sudoers_file"
+  visudo -cf /etc/sudoers || return 1
+  harden_log changed "$sudoers_file"
+}
+
+module_harden() {
+  append_report "## Basic hardening (mode: $([ "$HARDEN_APPLY" -eq 1 ] && printf apply || printf dry-run))"
+  : > "$EVIDENCE_DIR/hardening-actions.tsv"
+  : > "$EVIDENCE_DIR/hardening-plan.txt"
+  : > "$EVIDENCE_DIR/hardening-verification.txt"
+  harden_detect
+  harden_preflight || return 1
+  harden_write_file /etc/profile.d/99-sysdiag-timeout.sh 0644 "TMOUT=$HARDEN_TMOUT
+readonly TMOUT
+export TMOUT" || return 1
+  harden_write_file /etc/issue 0644 "$HARDEN_BANNER" || return 1
+  harden_write_file /etc/issue.net 0644 "$HARDEN_BANNER" || return 1
+  harden_configure_sysctl || return 1
+  harden_configure_grub || return 1
+  harden_packages || return 1
+  harden_pam_policy || return 1
+  harden_user_sudo || return 1
+  append_report '- Hardening evidence: hardening-environment.txt, hardening-plan.txt, hardening-actions.tsv, hardening-verification.txt.'
+}
+
 run_module() {
   case "$1" in
     baseline) module_baseline ;;
@@ -636,6 +878,7 @@ run_module() {
     network) module_network ;;
     service) module_service ;;
     tools) module_tools ;;
+    harden) module_harden ;;
     *) printf 'Unknown module: %s\n' "$1" >&2; return 1 ;;
   esac
 }
@@ -659,6 +902,7 @@ Available modules:
   service   Why did a service/container fail?
   baseline  Collect full baseline health report
   tools     Show optional tool/dependency detection
+  harden    Review/apply basic Linux hardening (dry-run by default)
 EOF_LIST
 }
 
@@ -691,6 +935,7 @@ MENU
       7) run_module tools ;;
       8) run_all_modules ;;
       9) package_run || true ;;
+      10) run_module harden ;;
       0|q|Q) return 0 ;;
       *) printf 'Invalid choice\n' ;;
     esac
@@ -718,6 +963,7 @@ menu_choice_tui() {
       7 'Show tool/dependency detection' \
       8 'Run all modules' \
       9 'Package current run as tarball' \
+      10 'Review/apply basic hardening' \
       0 'Quit' 3>&1 1>&2 2>&3)" || return 0
     case "$choice" in
       1) run_module reboot ;;
@@ -729,6 +975,7 @@ menu_choice_tui() {
       7) run_module tools ;;
       8) run_all_modules ;;
       9) package_run || true ;;
+      10) run_module harden ;;
       0) return 0 ;;
     esac
   done
@@ -773,6 +1020,9 @@ parse_args() {
         [ "$#" -ge 2 ] || { printf '--out requires a directory\n' >&2; exit 2; }
         OUT_DIR="$2"; shift 2 ;;
       --package) PACKAGE_ONLY=1; shift ;;
+      --apply) HARDEN_APPLY=1; shift ;;
+      --upgrade-packages) HARDEN_UPGRADE_PACKAGES=1; shift ;;
+      --allow-virtualization) HARDEN_ALLOW_VIRTUALIZATION=1; shift ;;
       --selftest) MODE="selftest"; shift ;;
       --version) printf '%s\n' "$APP_VERSION"; exit 0 ;;
       --no-color) shift ;;

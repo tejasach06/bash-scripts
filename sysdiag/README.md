@@ -15,7 +15,7 @@ The script is designed for mixed Linux estates: Debian/Ubuntu, RHEL/Rocky/Fedora
 
 ## Safety model
 
-Version 1 is read-only.
+Diagnostics remain read-only. The `harden` module is dry-run by default; use `--apply` explicitly to make changes. Apply mode requires root and edits local security configuration only; package upgrades require the separate `--upgrade-packages` opt-in. The default sudo rule remains `linuxteam ALL=(ALL) NOPASSWD:ALL`.
 
 It does not:
 
@@ -72,6 +72,15 @@ Run one module:
 ./sysdiag.sh --run service
 ./sysdiag.sh --run baseline
 ./sysdiag.sh --run tools
+
+# Review hardening without changing the system
+./sysdiag.sh --run harden --out /tmp/sysdiag-hardening-review
+
+# Apply hardening as root (prompts for linuxteam password)
+sudo ./sysdiag.sh --run harden --apply
+
+# Also permit package upgrades during apply mode
+sudo ./sysdiag.sh --run harden --apply --upgrade-packages
 ```
 
 Run all modules:
@@ -221,6 +230,7 @@ Quality gates for this script:
 bash -n sysdiag.sh
 shellcheck sysdiag.sh
 ./sysdiag.sh --selftest
+python3 -m unittest -v test_sysdiag_harden.py
 ./sysdiag.sh --list
 ./sysdiag.sh --version
 ./sysdiag.sh --run baseline --out /tmp/sysdiag-test-baseline
