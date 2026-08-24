@@ -19,10 +19,17 @@ from proxmox_inventory_extract import (
     parse_tags,
     map_status,
     map_os_family,
+    total_vcpus,
+    add_tag,
+    backup_coverage,
+    extract_vm,
+    serialize_vm,
+    write_csv,
     TEMPLATE_COLUMNS,
     IP_PREFIX_MAP,
     MULTI_SEP,
     DiskRecord,
+    ProxmoxClient,
 )
 
 
@@ -58,12 +65,14 @@ def test_ip_prefix_map_keys():
 
 def test_parse_size_to_gib():
     assert parse_size_to_gib("50G") == 50
+    assert parse_size_to_gib("100.5G") == 100
+    assert parse_size_to_gib("2.5T") == 2560
     assert parse_size_to_gib("512M") == 0  # 512M = 0.5G -> 0 in integer GiB
     assert parse_size_to_gib("1024M") == 1
     assert parse_size_to_gib("1T") == 1024
     assert parse_size_to_gib("100") == 0  # bytes -> 0 GiB
     assert parse_size_to_gib("") == 0
-
+    assert parse_size_to_gib("garbage") == 0
 
 def test_parse_disk_value():
     # LVM format
@@ -128,7 +137,7 @@ def test_parse_disks():
         "unused": "some-value",
     }
 
-    disks = parse_disks(config, storage_meta)
+    disks = parse_disks(config, storage_meta, {})
 
     assert len(disks) == 5  # scsi0, scsi1, virtio0, efidisk0, tpmstate0
 
@@ -180,7 +189,7 @@ def test_parse_disks_storage_fallback():
         "virtio0": "ceph0:vm-100-disk-1,size=100G",
     }
 
-    disks = parse_disks(config, storage_meta)
+    disks = parse_disks(config, storage_meta, {})
 
     assert len(disks) == 2
     for d in disks:
@@ -198,7 +207,7 @@ def test_parse_disks_malformed():
     }
 
     # Should not raise
-    disks = parse_disks(config, storage_meta)
+    disks = parse_disks(config, storage_meta, {})
     assert len(disks) == 1  # Only scsi0 valid
     assert disks[0].config_key == "scsi0"
 
@@ -242,9 +251,9 @@ def test_map_os_family():
     assert map_os_family("l26", None) == "linux"
     assert map_os_family("w2022", None) == "windows"
     assert map_os_family("w10", "windows") == "windows"
-    # Unknown ostype defaults to linux
-    assert map_os_family("unknown", None) == "linux"
-
+    # Unknown ostype defaults to "other"
+    assert map_os_family("unknown", None) == "other"
+    assert map_os_family("", None) == ""
 
 def test_disk_record_csv_field():
     d = DiskRecord(
@@ -315,3 +324,338 @@ def test_full_csv_write():
         assert rows[0]["private_ip"] == "172.16.0.10"
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+
+def test_total_vcpus():
+    assert total_vcpus({"cores": 4, "sockets": 2}) == "8"
+    assert total_vcpus({"cores": 2}) == "2"
+    assert total_vcpus({}) == ""
+    assert total_vcpus({"cores": 0}) == ""
+
+
+def test_backup_coverage():
+    jobs = [{"enabled": 1, "all": 1, "exclude": "101", "storage": "pbs"}]
+    assert backup_coverage(jobs, 100, "") == ("true", "pbs")
+    assert backup_coverage(jobs, 101, "") == ("false", "")
+
+    disabled_jobs = [{"enabled": 0, "all": 1, "storage": "pbs"}]
+    assert backup_coverage(disabled_jobs, 100, "") == ("false", "")
+
+    pool_jobs = [{"enabled": 1, "pool": "prod", "storage": "nfs1"}]
+    assert backup_coverage(pool_jobs, 100, "prod") == ("true", "nfs1")
+    assert backup_coverage(pool_jobs, 100, "") == ("false", "")
+
+
+def test_add_tag():
+    assert add_tag("web;prod", "template") == "web;prod;template"
+    assert add_tag("template", "template") == "template"
+    assert add_tag("", "template") == "template"
+
+
+def test_parse_disks_volume_usage():
+    storage_meta = {"local-lvm": {"vgname": "vg02", "type": "lvm-thin"}}
+    config = {"scsi0": "local-lvm:vm-100-disk-0,size=50G"}
+
+    disks_alloc = parse_disks(config, storage_meta, {"local-lvm:vm-100-disk-0": 12})
+    assert len(disks_alloc) == 1
+    assert disks_alloc[0].size_gib == 12
+    assert disks_alloc[0].to_csv_field() == "vm-100-disk-0-scsi0:12:vg02:lvm-thin"
+
+    disks_prov = parse_disks(config, storage_meta, {})
+    assert len(disks_prov) == 1
+    assert disks_prov[0].size_gib == 50
+
+
+def test_parse_disks_unused():
+    storage_meta = {"local-lvm": {"vgname": "vg02", "type": "lvm-thin"}}
+    config = {"unused0": "local-lvm:vm-100-disk-1"}
+
+    # With volume usage -> emitted
+    disks = parse_disks(config, storage_meta, {"local-lvm:vm-100-disk-1": 20})
+    assert len(disks) == 1
+    assert disks[0].config_key == "unused0"
+    assert disks[0].size_gib == 20
+    assert disks[0].lv_name == "vm-100-disk-1"
+
+    # Without volume usage -> skipped
+    disks_empty = parse_disks(config, storage_meta, {})
+    assert len(disks_empty) == 0
+
+
+def test_get_cluster_name_resolution():
+    class MockClient(ProxmoxClient):
+        def __init__(self, data):
+            self.data = data
+        def api_get(self, path: str):
+            return self.data
+
+    # Node listed first before cluster
+    c1 = MockClient([
+        {"type": "node", "name": "pve-node-1"},
+        {"type": "cluster", "name": "production-cluster"},
+    ])
+    assert c1.get_cluster_name() == "production-cluster"
+
+    # Standalone (no cluster type)
+    c2 = MockClient([{"type": "node", "name": "pve-node-1"}])
+    assert c2.get_cluster_name() == "standalone"
+
+
+class StubClient:
+    def __init__(self, template=0, hastate="started", agent=1):
+        self.template = template
+        self.hastate = hastate
+        self.agent = agent
+
+    def get_agent_info(self, node, vmid):
+        return {"version": "8.2.2"} if self.agent else None
+
+    def get_cluster_vms(self):
+        return [{
+            "id": "qemu/100",
+            "vmid": 100,
+            "name": "prod-web-01",
+            "node": "node1",
+            "status": "running",
+            "template": self.template,
+            "pool": "prod",
+            "hastate": self.hastate,
+        }]
+
+    def get_vm_config(self, node, vmid):
+        return {
+            "name": "prod-web-01",
+            "cores": 2,
+            "sockets": 2,
+            "memory": 8192,
+            "scsi0": "local-lvm:vm-100-disk-0,size=50G",
+            "tags": "web",
+            "ostype": "l26",
+            "agent": str(self.agent),
+        }
+
+    def get_storage_config(self, node):
+        return [{"storage": "local-lvm", "type": "lvm-thin", "vgname": "pve-thin"}]
+
+    def get_storage_content(self, node, storage):
+        return [{"volid": "local-lvm:vm-100-disk-0", "used": 15 * (1024**3)}]
+
+    def get_backup_jobs(self):
+        return [{"enabled": 1, "all": 1, "storage": "pbs-storage"}]
+
+    def get_cluster_name(self):
+        return "prod-cluster"
+
+    def get_guest_ips(self, node, vmid):
+        return ["172.16.10.50", "10.0.0.50"]
+
+    def get_guest_os(self, node, vmid):
+        return {"os_family": "linux", "os_distribution": "Ubuntu 22.04", "os_version": "22.04"}
+
+    def get_guest_fqdn(self, node, vmid):
+        return "prod-web-01.example.com"
+
+
+def test_end_to_end_extract_vm():
+    stub = StubClient(template=0, hastate="started")
+    storage_meta = {"local-lvm": {"vgname": "pve-thin", "type": "lvm-thin"}}
+    volume_usage = {"local-lvm:vm-100-disk-0": 15}
+    backup_jobs = stub.get_backup_jobs()
+    resource = stub.get_cluster_vms()[0]
+    verified_at = "2026-08-24T16:00:00Z"
+
+    row = extract_vm(
+        client=stub,
+        node="node1",
+        vmid=100,
+        cluster_name="prod-cluster",
+        storage_meta=storage_meta,
+        resource=resource,
+        backup_jobs=backup_jobs,
+        volume_usage=volume_usage,
+        verified_at=verified_at,
+        status="running",
+    )
+
+    assert row is not None
+    assert row["name"] == "prod-web-01"
+    assert row["external_id"] == "100"
+    assert row["cluster"] == "prod-cluster"
+    assert row["node"] == "node1"
+    assert row["status"] == "running"
+    assert row["cpu_cores"] == "4"  # 2 cores * 2 sockets
+    assert row["memory_mb"] == "8192"
+    assert row["disks"] == "vm-100-disk-0-scsi0:15:pve-thin:lvm-thin"
+    assert row["ha_enabled"] == "true"
+    assert row["backup_enabled"] == "true"
+    assert row["backup_location"] == "pbs-storage"
+    assert row["tags"] == "web"
+    assert row["last_verified_at"] == verified_at
+    assert row["fqdn"] == "prod-web-01.example.com"
+    assert row["os_distribution"] == "Ubuntu 22.04"
+    assert row["private_ip"] == "172.16.10.50"
+    assert row["backup_ip"] == "10.0.0.50"
+
+
+def test_template_handling():
+    stub = StubClient(template=1, hastate="")
+    storage_meta = {"local-lvm": {"vgname": "pve-thin", "type": "lvm-thin"}}
+    volume_usage = {"local-lvm:vm-100-disk-0": 15}
+    backup_jobs = stub.get_backup_jobs()
+    resource = stub.get_cluster_vms()[0]
+    verified_at = "2026-08-24T16:00:00Z"
+
+    row = extract_vm(
+        client=stub,
+        node="node1",
+        vmid=100,
+        cluster_name="prod-cluster",
+        storage_meta=storage_meta,
+        resource=resource,
+        backup_jobs=backup_jobs,
+        volume_usage=volume_usage,
+        verified_at=verified_at,
+        status="running",
+    )
+
+    assert row is not None
+    assert row["tags"] == "web;template"
+    assert row["status"] in ("running", "powered_off", "unknown")
+    assert row["ha_enabled"] == "false"
+
+
+def test_header_stability():
+    stub = StubClient()
+    storage_meta = {"local-lvm": {"vgname": "pve-thin", "type": "lvm-thin"}}
+    volume_usage = {"local-lvm:vm-100-disk-0": 15}
+    resource = stub.get_cluster_vms()[0]
+    row = extract_vm(
+        client=stub,
+        node="node1",
+        vmid=100,
+        cluster_name="prod-cluster",
+        storage_meta=storage_meta,
+        resource=resource,
+        backup_jobs=stub.get_backup_jobs(),
+        volume_usage=volume_usage,
+        verified_at="2026-08-24T16:00:00Z",
+        status="running",
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+        tmp_path = f.name
+    try:
+        write_csv([row], tmp_path)
+        first_line = Path(tmp_path).read_text().splitlines()[0]
+        assert first_line == ",".join(TEMPLATE_COLUMNS)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+def test_get_guest_os_version_composition():
+    class OsMockClient(ProxmoxClient):
+        def __init__(self, data):
+            self.data = data
+        def api_get(self, path: str):
+            return self.data
+
+    # Version + kernel
+    c1 = OsMockClient({
+        "id": "ubuntu",
+        "pretty-name": "Ubuntu 22.04.3 LTS",
+        "version-id": "22.04",
+        "kernel-release": "5.15.0-91-generic",
+    })
+    os1 = c1.get_guest_os("node1", 100)
+    assert os1["os_family"] == "ubuntu"
+    assert os1["os_distribution"] == "Ubuntu 22.04.3 LTS"
+    assert os1["os_version"] == "22.04 (5.15.0-91-generic)"
+
+    # Version without kernel (e.g. Windows)
+    c2 = OsMockClient({
+        "id": "mswindows",
+        "pretty-name": "Windows Server 2022",
+        "version-id": "2022",
+    })
+    os2 = c2.get_guest_os("node1", 100)
+    assert os2["os_version"] == "2022"
+
+    # Kernel only
+    c3 = OsMockClient({"kernel-release": "6.1.0"})
+    os3 = c3.get_guest_os("node1", 100)
+    assert os3["os_version"] == "6.1.0"
+
+
+def test_extract_vm_agent_gating_agent_disabled():
+    stub = StubClient(agent=0)
+    storage_meta = {"local-lvm": {"vgname": "pve-thin", "type": "lvm-thin"}}
+    volume_usage = {"local-lvm:vm-100-disk-0": 15}
+    resource = stub.get_cluster_vms()[0]
+    row = extract_vm(
+        client=stub,
+        node="node1",
+        vmid=100,
+        cluster_name="prod-cluster",
+        storage_meta=storage_meta,
+        resource=resource,
+        backup_jobs=stub.get_backup_jobs(),
+        volume_usage=volume_usage,
+        verified_at="2026-08-24T16:00:00Z",
+        status="running",
+    )
+    assert row is not None
+    assert row["fqdn"] == ""
+    assert row["os_distribution"] == ""
+    assert row["private_ip"] == ""
+    assert row["public_ip"] == ""
+    assert row["backup_ip"] == ""
+
+
+def test_extract_vm_stopped_vm_never_probes_agent():
+    class UnreachableStub(StubClient):
+        def get_agent_info(self, node, vmid):
+            raise AssertionError("Agent probe should not be called on stopped VM")
+
+    stub = UnreachableStub(agent=1)
+    storage_meta = {"local-lvm": {"vgname": "pve-thin", "type": "lvm-thin"}}
+    volume_usage = {"local-lvm:vm-100-disk-0": 15}
+    resource = stub.get_cluster_vms()[0]
+    row = extract_vm(
+        client=stub,
+        node="node1",
+        vmid=100,
+        cluster_name="prod-cluster",
+        storage_meta=storage_meta,
+        resource=resource,
+        backup_jobs=stub.get_backup_jobs(),
+        volume_usage=volume_usage,
+        verified_at="2026-08-24T16:00:00Z",
+        status="stopped",
+    )
+    assert row is not None
+    assert row["fqdn"] == ""
+    assert row["status"] == "powered_off"
+
+
+def test_extract_vm_config_omits_agent_flag():
+    class NoAgentFlagStub(StubClient):
+        def get_vm_config(self, node, vmid):
+            cfg = super().get_vm_config(node, vmid)
+            cfg.pop("agent", None)
+            return cfg
+
+    stub = NoAgentFlagStub(agent=1)
+    storage_meta = {"local-lvm": {"vgname": "pve-thin", "type": "lvm-thin"}}
+    volume_usage = {"local-lvm:vm-100-disk-0": 15}
+    resource = stub.get_cluster_vms()[0]
+    row = extract_vm(
+        client=stub,
+        node="node1",
+        vmid=100,
+        cluster_name="prod-cluster",
+        storage_meta=storage_meta,
+        resource=resource,
+        backup_jobs=stub.get_backup_jobs(),
+        volume_usage=volume_usage,
+        verified_at="2026-08-24T16:00:00Z",
+        status="running",
+    )
+    assert row is not None
+    assert row["fqdn"] == "prod-web-01.example.com"
