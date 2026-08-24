@@ -67,10 +67,10 @@ def test_parse_size_to_gib():
     assert parse_size_to_gib("50G") == 50
     assert parse_size_to_gib("100.5G") == 100
     assert parse_size_to_gib("2.5T") == 2560
-    assert parse_size_to_gib("512M") == 0  # 512M = 0.5G -> 0 in integer GiB
+    assert parse_size_to_gib("512M") == 1
     assert parse_size_to_gib("1024M") == 1
     assert parse_size_to_gib("1T") == 1024
-    assert parse_size_to_gib("100") == 0  # bytes -> 0 GiB
+    assert parse_size_to_gib("100") == 1
     assert parse_size_to_gib("") == 0
     assert parse_size_to_gib("garbage") == 0
 
@@ -167,14 +167,14 @@ def test_parse_disks():
     # Check efidisk0
     de = next(d for d in disks if d.config_key == "efidisk0")
     assert de.lv_name == "vm-100-disk-efi"
-    assert de.size_gib == 0  # 4M -> 0 GiB
-    assert de.to_csv_field() == "vm-100-disk-efi-efidisk0:0:vg01:lvm"
+    assert de.size_gib == 1
+    assert de.to_csv_field() == "vm-100-disk-efi-efidisk0:1:vg01:lvm"
 
     # Check tpmstate0
     dt = next(d for d in disks if d.config_key == "tpmstate0")
     assert dt.lv_name == "vm-100-disk-tpm"
-    assert dt.size_gib == 0
-    assert dt.to_csv_field() == "vm-100-disk-tpm-tpmstate0:0:vg01:lvm"
+    assert dt.size_gib == 1
+    assert dt.to_csv_field() == "vm-100-disk-tpm-tpmstate0:1:vg01:lvm"
 
 
 def test_parse_disks_storage_fallback():
@@ -208,8 +208,8 @@ def test_parse_disks_malformed():
 
     # Should not raise
     disks = parse_disks(config, storage_meta, {})
-    assert len(disks) == 1  # Only scsi0 valid
-    assert disks[0].config_key == "scsi0"
+    assert len(disks) == 2  # scsi0 valid, scsi2 valid with size 0 (scsi1 malformed string skipped)
+    assert set(d.config_key for d in disks) == {"scsi0", "scsi2"}
 
 
 def test_classify_ips():
@@ -328,7 +328,7 @@ def test_full_csv_write():
 def test_total_vcpus():
     assert total_vcpus({"cores": 4, "sockets": 2}) == "8"
     assert total_vcpus({"cores": 2}) == "2"
-    assert total_vcpus({}) == ""
+    assert total_vcpus({}) == "1"
     assert total_vcpus({"cores": 0}) == ""
 
 
@@ -351,19 +351,18 @@ def test_add_tag():
     assert add_tag("", "template") == "template"
 
 
-def test_parse_disks_volume_usage():
+def test_parse_disks_volume_sizes():
     storage_meta = {"local-lvm": {"vgname": "vg02", "type": "lvm-thin"}}
     config = {"scsi0": "local-lvm:vm-100-disk-0,size=50G"}
 
-    disks_alloc = parse_disks(config, storage_meta, {"local-lvm:vm-100-disk-0": 12})
-    assert len(disks_alloc) == 1
-    assert disks_alloc[0].size_gib == 12
-    assert disks_alloc[0].to_csv_field() == "vm-100-disk-0-scsi0:12:vg02:lvm-thin"
-
-    disks_prov = parse_disks(config, storage_meta, {})
+    disks_prov = parse_disks(config, storage_meta, {"local-lvm:vm-100-disk-0": 12})
     assert len(disks_prov) == 1
     assert disks_prov[0].size_gib == 50
+    assert disks_prov[0].to_csv_field() == "vm-100-disk-0-scsi0:50:vg02:lvm-thin"
 
+    disks_fallback = parse_disks({"scsi0": "local-lvm:vm-100-disk-0"}, storage_meta, {"local-lvm:vm-100-disk-0": 12})
+    assert len(disks_fallback) == 1
+    assert disks_fallback[0].size_gib == 12
 
 def test_parse_disks_unused():
     storage_meta = {"local-lvm": {"vgname": "vg02", "type": "lvm-thin"}}
@@ -376,9 +375,10 @@ def test_parse_disks_unused():
     assert disks[0].size_gib == 20
     assert disks[0].lv_name == "vm-100-disk-1"
 
-    # Without volume usage -> skipped
+    # Without volume usage -> emitted with size 0
     disks_empty = parse_disks(config, storage_meta, {})
-    assert len(disks_empty) == 0
+    assert len(disks_empty) == 1
+    assert disks_empty[0].size_gib == 0
 
 
 def test_get_cluster_name_resolution():
@@ -458,7 +458,7 @@ class StubClient:
 def test_end_to_end_extract_vm():
     stub = StubClient(template=0, hastate="started")
     storage_meta = {"local-lvm": {"vgname": "pve-thin", "type": "lvm-thin"}}
-    volume_usage = {"local-lvm:vm-100-disk-0": 15}
+    volume_sizes = {"local-lvm:vm-100-disk-0": 15}
     backup_jobs = stub.get_backup_jobs()
     resource = stub.get_cluster_vms()[0]
     verified_at = "2026-08-24T16:00:00Z"
@@ -471,7 +471,7 @@ def test_end_to_end_extract_vm():
         storage_meta=storage_meta,
         resource=resource,
         backup_jobs=backup_jobs,
-        volume_usage=volume_usage,
+        volume_sizes=volume_sizes,
         verified_at=verified_at,
         status="running",
     )
@@ -484,7 +484,7 @@ def test_end_to_end_extract_vm():
     assert row["status"] == "running"
     assert row["cpu_cores"] == "4"  # 2 cores * 2 sockets
     assert row["memory_mb"] == "8192"
-    assert row["disks"] == "vm-100-disk-0-scsi0:15:pve-thin:lvm-thin"
+    assert row["disks"] == "vm-100-disk-0-scsi0:50:pve-thin:lvm-thin"
     assert row["ha_enabled"] == "true"
     assert row["backup_enabled"] == "true"
     assert row["backup_location"] == "pbs-storage"
@@ -499,7 +499,7 @@ def test_end_to_end_extract_vm():
 def test_template_handling():
     stub = StubClient(template=1, hastate="")
     storage_meta = {"local-lvm": {"vgname": "pve-thin", "type": "lvm-thin"}}
-    volume_usage = {"local-lvm:vm-100-disk-0": 15}
+    volume_sizes = {"local-lvm:vm-100-disk-0": 15}
     backup_jobs = stub.get_backup_jobs()
     resource = stub.get_cluster_vms()[0]
     verified_at = "2026-08-24T16:00:00Z"
@@ -512,7 +512,7 @@ def test_template_handling():
         storage_meta=storage_meta,
         resource=resource,
         backup_jobs=backup_jobs,
-        volume_usage=volume_usage,
+        volume_sizes=volume_sizes,
         verified_at=verified_at,
         status="running",
     )
@@ -526,7 +526,7 @@ def test_template_handling():
 def test_header_stability():
     stub = StubClient()
     storage_meta = {"local-lvm": {"vgname": "pve-thin", "type": "lvm-thin"}}
-    volume_usage = {"local-lvm:vm-100-disk-0": 15}
+    volume_sizes = {"local-lvm:vm-100-disk-0": 15}
     resource = stub.get_cluster_vms()[0]
     row = extract_vm(
         client=stub,
@@ -536,7 +536,7 @@ def test_header_stability():
         storage_meta=storage_meta,
         resource=resource,
         backup_jobs=stub.get_backup_jobs(),
-        volume_usage=volume_usage,
+        volume_sizes=volume_sizes,
         verified_at="2026-08-24T16:00:00Z",
         status="running",
     )
@@ -586,7 +586,7 @@ def test_get_guest_os_version_composition():
 def test_extract_vm_agent_gating_agent_disabled():
     stub = StubClient(agent=0)
     storage_meta = {"local-lvm": {"vgname": "pve-thin", "type": "lvm-thin"}}
-    volume_usage = {"local-lvm:vm-100-disk-0": 15}
+    volume_sizes = {"local-lvm:vm-100-disk-0": 15}
     resource = stub.get_cluster_vms()[0]
     row = extract_vm(
         client=stub,
@@ -596,7 +596,7 @@ def test_extract_vm_agent_gating_agent_disabled():
         storage_meta=storage_meta,
         resource=resource,
         backup_jobs=stub.get_backup_jobs(),
-        volume_usage=volume_usage,
+        volume_sizes=volume_sizes,
         verified_at="2026-08-24T16:00:00Z",
         status="running",
     )
@@ -615,7 +615,7 @@ def test_extract_vm_stopped_vm_never_probes_agent():
 
     stub = UnreachableStub(agent=1)
     storage_meta = {"local-lvm": {"vgname": "pve-thin", "type": "lvm-thin"}}
-    volume_usage = {"local-lvm:vm-100-disk-0": 15}
+    volume_sizes = {"local-lvm:vm-100-disk-0": 15}
     resource = stub.get_cluster_vms()[0]
     row = extract_vm(
         client=stub,
@@ -625,7 +625,7 @@ def test_extract_vm_stopped_vm_never_probes_agent():
         storage_meta=storage_meta,
         resource=resource,
         backup_jobs=stub.get_backup_jobs(),
-        volume_usage=volume_usage,
+        volume_sizes=volume_sizes,
         verified_at="2026-08-24T16:00:00Z",
         status="stopped",
     )
@@ -643,7 +643,7 @@ def test_extract_vm_config_omits_agent_flag():
 
     stub = NoAgentFlagStub(agent=1)
     storage_meta = {"local-lvm": {"vgname": "pve-thin", "type": "lvm-thin"}}
-    volume_usage = {"local-lvm:vm-100-disk-0": 15}
+    volume_sizes = {"local-lvm:vm-100-disk-0": 15}
     resource = stub.get_cluster_vms()[0]
     row = extract_vm(
         client=stub,
@@ -653,9 +653,92 @@ def test_extract_vm_config_omits_agent_flag():
         storage_meta=storage_meta,
         resource=resource,
         backup_jobs=stub.get_backup_jobs(),
-        volume_usage=volume_usage,
+        volume_sizes=volume_sizes,
         verified_at="2026-08-24T16:00:00Z",
         status="running",
     )
     assert row is not None
     assert row["fqdn"] == "prod-web-01.example.com"
+def test_scsihw_not_matched_as_disk(capsys):
+    config = {"scsihw": "virtio-scsi-single", "scsi0": "local-lvm:vm-100-disk-0,size=50G"}
+    disks = parse_disks(config, {}, {})
+    assert len(disks) == 1
+    assert disks[0].config_key == "scsi0"
+    captured = capsys.readouterr()
+    assert "Skipping malformed disk" not in captured.err
+
+
+def test_parse_size_to_gib_sub_gib_and_bytes():
+    assert parse_size_to_gib("4M") == 1
+    assert parse_size_to_gib("512K") == 1
+    assert parse_size_to_gib("1073741824") == 1
+    assert parse_size_to_gib("50G") == 50
+    assert parse_size_to_gib("1T") == 1024
+    assert parse_size_to_gib("bogus") == 0
+    assert parse_size_to_gib("0") == 0
+
+
+def test_parse_disks_provisioned_size_over_used():
+    disks = parse_disks({"scsi0": "lvm:vm-1-disk-0,size=100G"}, {}, {"lvm:vm-1-disk-0": 3})
+    assert len(disks) == 1
+    assert disks[0].to_csv_field() == "vm-1-disk-0-scsi0:100:lvm:"
+
+
+def test_total_vcpus_defaults():
+    assert total_vcpus({"sockets": 2}) == "2"
+    assert total_vcpus({"cores": 4}) == "4"
+    assert total_vcpus({"cores": 2, "sockets": 2}) == "4"
+    assert total_vcpus({"cores": "x"}) == ""
+
+
+def test_main_empty_cluster_vms_fallback(monkeypatch, tmp_path):
+    from proxmox_inventory_extract import main
+
+    class FallbackClient(ProxmoxClient):
+        def __init__(self):
+            pass
+        def get_ticket(self):
+            pass
+        def get_cluster_name(self):
+            return "cluster1"
+        def get_nodes(self):
+            return ["node1"]
+        def get_backup_jobs(self):
+            return []
+        def get_cluster_vms(self):
+            return []
+        def get_storage_config(self, node):
+            return []
+        def get_storage_content(self, node, storage):
+            return []
+        def get_vms_for_node(self, node):
+            return [{"vmid": 100, "status": "running"}]
+        def get_vm_config(self, node, vmid):
+            return {"name": "vm100", "cores": 2}
+        def get_agent_info(self, node, vmid):
+            return None
+
+    csv_out = str(tmp_path / "out.csv")
+    monkeypatch.setattr("sys.argv", ["proxmox-inventory-extract.py", "-o", csv_out, "-p", "dummy"])
+    monkeypatch.setattr("proxmox_inventory_extract.ProxmoxClient", lambda **kw: FallbackClient())
+
+    rc = main()
+    assert rc == 2
+    content = Path(csv_out).read_text()
+    assert "vm100" in content
+
+
+def test_resolve_password_empty_env_prompts(monkeypatch):
+    from proxmox_inventory_extract import resolve_password
+    monkeypatch.setenv("PVE_PASSWORD", "")
+    monkeypatch.setattr("getpass.getpass", lambda prompt: "prompted_pw")
+
+    class Args:
+        password = None
+
+    assert resolve_password(Args()) == "prompted_pw"
+
+
+def test_classify_ips_deduplication():
+    res = classify_ips(["172.16.0.5", "172.16.0.5"])
+    assert res["private_ip"] == ["172.16.0.5"]

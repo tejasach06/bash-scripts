@@ -46,7 +46,7 @@ Matches InventoryMGR's `TEMPLATE_COLUMNS` exactly (35 columns in fixed order):
 | `environment` | *(empty — not available from Proxmox)* |
 | `criticality` | *(empty — not available from Proxmox)* |
 | `vm_type` | *(empty — not available from Proxmox)* |
-| `cpu_cores` | VM config `cores` |
+| `cpu_cores` | VM config cores x sockets (each defaults to 1) |
 | `memory_mb` | VM config `memory` |
 | `disks` | `;`-separated `disk_name:size_GiB:storage_name:storage_type` |
 | `storage_name` | *(empty — per-disk storage in `disks` column)* |

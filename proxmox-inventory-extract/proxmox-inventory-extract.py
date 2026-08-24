@@ -31,7 +31,7 @@ TEMPLATE_COLUMNS = (
     "decommission_date", "security_remarks", "description",
 )
 
-# IP prefix → InventoryMGR column name. Longest match wins.
+# IP prefix → InventoryMGR column. First match in declaration order wins.
 IP_PREFIX_MAP = {
     "10.":  "backup_ip",
     "172.": "private_ip",
@@ -49,11 +49,8 @@ OSTYPE_FAMILY = {
     "solaris": "solaris", "openbsd": "bsd", "freebsd": "bsd", "netbsd": "bsd",
 }
 
-# Supported disk config keys in Proxmox VM config
-DISK_KEY_PATTERNS = (
-    "efidisk", "tpmstate",
-    "scsi", "virtio", "ide", "sata", "unused",
-)
+# Supported disk config key regex in Proxmox VM config
+DISK_KEY_RE = re.compile(r"^(?:scsi|virtio|ide|sata|unused|efidisk|tpmstate)\d+$")
 
 # Proxmox status → InventoryMGR status mapping
 STATUS_MAP = {
@@ -216,8 +213,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def resolve_password(args: argparse.Namespace) -> str:
     if args.password:
         return args.password
-    if "PVE_PASSWORD" in os.environ:
-        return os.environ["PVE_PASSWORD"]
+    env_pw = os.environ.get("PVE_PASSWORD")
+    if env_pw:
+        return env_pw
     try:
         import getpass
         return getpass.getpass("Proxmox password: ")
@@ -245,9 +243,9 @@ def build_storage_meta(client: ProxmoxClient, node: str) -> dict[str, dict]:
     return meta
 
 
-def build_volume_usage(client: ProxmoxClient, node: str, storage_ids: list[str]) -> dict[str, int]:
-    """volid -> allocated GiB from storage content 'used'; 0 when unreported."""
-    usage: dict[str, int] = {}
+def build_volume_sizes(client: ProxmoxClient, node: str, storage_ids: list[str]) -> dict[str, int]:
+    """volid -> provisioned GiB from storage content 'size'; 0 when unreported."""
+    sizes: dict[str, int] = {}
     for sid in storage_ids:
         try:
             content = client.get_storage_content(node, sid)
@@ -258,15 +256,15 @@ def build_volume_usage(client: ProxmoxClient, node: str, storage_ids: list[str])
             for vol in content:
                 volid = vol.get("volid")
                 if volid:
-                    usage[volid] = int(vol.get("used") or 0) // (1024 ** 3)
-    return usage
+                    sizes[volid] = int(vol.get("size") or 0) // (1024 ** 3)
+    return sizes
 
 
-def parse_disks(config: dict, storage_meta: dict, volume_usage: dict[str, int]) -> list[DiskRecord]:
+def parse_disks(config: dict, storage_meta: dict, volume_sizes: dict[str, int]) -> list[DiskRecord]:
     """Parse all supported disk config keys into structured DiskRecord list."""
     disks: list[DiskRecord] = []
     for key, value in config.items():
-        if not any(key.startswith(p) for p in DISK_KEY_PATTERNS):
+        if not DISK_KEY_RE.match(key):
             continue
         if not value or value == "none":
             continue
@@ -275,9 +273,9 @@ def parse_disks(config: dict, storage_meta: dict, volume_usage: dict[str, int]) 
 
         lv_name, provisioned_size_gib, storage_id, size_found = parse_disk_value(value)
         volid = str(value).split(",")[0]
-        size_gib = volume_usage.get(volid) or provisioned_size_gib
+        size_gib = provisioned_size_gib if size_found else volume_sizes.get(volid, 0)
 
-        if not lv_name or (size_gib == 0 and not size_found and (volid not in volume_usage or volume_usage.get(volid, 0) == 0)):
+        if not lv_name:
             print(f"[warn] Skipping malformed disk {key}={value}", file=sys.stderr)
             continue
 
@@ -294,7 +292,6 @@ def parse_disks(config: dict, storage_meta: dict, volume_usage: dict[str, int]) 
             storage_type=storage_type,
         ))
     return disks
-
 
 def parse_disk_value(value: str) -> tuple[str, int, str, bool]:
     """Parse Proxmox disk config value into (lv_name, size_gib, storage_id, size_found)."""
@@ -322,31 +319,25 @@ def parse_disk_value(value: str) -> tuple[str, int, str, bool]:
     return lv_name, size_gib, storage_id, size_found
 
 
+_UNIT_BYTES = {"": 1, "B": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+
+
 def parse_size_to_gib(size_str: str) -> int:
-    """Parse Proxmox size string (e.g., '50G', '512M', '1T') to GiB."""
+    """Parse Proxmox size string (e.g., '50G', '512M', '1T') to GiB; round up sub-GiB non-zero to 1."""
     size_str = size_str.strip().upper()
-    if not size_str:
+    m = re.match(r"^(\d+(?:\.\d+)?)([KMGT]?)B?$", size_str)
+    if not m:
         return 0
-    match = re.match(r"^(\d+(?:\.\d+)?)([KMGT]?)B?$", size_str)
-    if not match:
+    total = float(m.group(1)) * _UNIT_BYTES[m.group(2)]
+    if total <= 0:
         return 0
-    value = float(match.group(1))
-    unit = match.group(2) or "B"
-    if unit == "K":
-        return int(value / (1024 * 1024))
-    elif unit == "M":
-        return int(value / 1024)
-    elif unit == "G":
-        return int(value)
-    elif unit == "T":
-        return int(value * 1024)
-    return 0
+    return max(1, int(total // (1024 ** 3)))
 
 
 def classify_ips(ips: list[str]) -> dict[str, list[str]]:
     """Classify IPs by prefix map into InventoryMGR role columns."""
     result = {"private_ip": [], "public_ip": [], "backup_ip": []}
-    for ip in ips:
+    for ip in dict.fromkeys(ips):
         matched = False
         for prefix, column in IP_PREFIX_MAP.items():
             if ip.startswith(prefix):
@@ -378,13 +369,15 @@ def map_status(proxmox_status: str) -> str:
     return STATUS_MAP.get(proxmox_status, "unknown")
 
 def total_vcpus(config: dict) -> str:
-    """Proxmox vCPU count = cores * sockets; sockets defaults to 1."""
+    """Proxmox vCPU count = cores * sockets; both default to 1."""
     try:
-        cores = int(config.get("cores", 0) or 0)
-        sockets = int(config.get("sockets", 1) or 1)
+        c_val = config.get("cores")
+        s_val = config.get("sockets")
+        cores = int(1 if c_val is None or c_val == "" else c_val)
+        sockets = int(1 if s_val is None or s_val == "" else s_val)
     except (TypeError, ValueError):
         return ""
-    if cores <= 0:
+    if cores <= 0 or sockets <= 0:
         return ""
     return str(cores * sockets)
 
@@ -539,7 +532,7 @@ def extract_vm(
     storage_meta: dict,
     resource: dict,
     backup_jobs: list[dict],
-    volume_usage: dict[str, int],
+    volume_sizes: dict[str, int],
     verified_at: str,
     status: str = "unknown",
 ) -> Optional[dict]:
@@ -550,14 +543,11 @@ def extract_vm(
         print(f"[warn] Failed to get config for VM {vmid} on {node}: {e}", file=sys.stderr)
         return None
 
-    if status not in ("running", "stopped"):
-        # Still try to extract; status will be 'unknown'
-        pass
     description = config.get("description", "")
     tags = parse_tags(config)
 
     # Disks
-    disks = parse_disks(config, storage_meta, volume_usage)
+    disks = parse_disks(config, storage_meta, volume_sizes)
 
     # Guest agent data (probed on running VMs)
     agent_live = False
@@ -652,14 +642,14 @@ def main() -> int:
 
     all_rows: list[dict] = []
     storage_meta_cache: dict[str, dict[str, dict]] = {}
-    volume_usage_cache: dict[str, dict[str, int]] = {}
+    volume_sizes_cache: dict[str, dict[str, int]] = {}
 
     def get_node_caches(node: str) -> tuple[dict[str, dict], dict[str, int]]:
         if node not in storage_meta_cache:
             sm = build_storage_meta(client, node)
             storage_meta_cache[node] = sm
-            volume_usage_cache[node] = build_volume_usage(client, node, list(sm.keys()))
-        return storage_meta_cache[node], volume_usage_cache[node]
+            volume_sizes_cache[node] = build_volume_sizes(client, node, list(sm.keys()))
+        return storage_meta_cache[node], volume_sizes_cache[node]
 
     # VM discovery via cluster resources with per-node fallback
     use_fallback = False
@@ -671,6 +661,10 @@ def main() -> int:
         use_fallback = True
         cluster_vms = []
 
+    if not use_fallback and not cluster_vms:
+        print("[warn] cluster/resources returned no VMs, falling back to per-node enumeration", file=sys.stderr)
+        partial_failure = True
+        use_fallback = True
     if not use_fallback:
         for resource in cluster_vms:
             vmid = resource.get("vmid")
@@ -678,7 +672,7 @@ def main() -> int:
                 continue
             node = resource.get("node", "")
             status = resource.get("status", "unknown")
-            storage_meta, volume_usage = get_node_caches(node)
+            storage_meta, volume_sizes = get_node_caches(node)
             row = extract_vm(
                 client=client,
                 node=node,
@@ -687,7 +681,7 @@ def main() -> int:
                 storage_meta=storage_meta,
                 resource=resource,
                 backup_jobs=backup_jobs,
-                volume_usage=volume_usage,
+                volume_sizes=volume_sizes,
                 verified_at=verified_at,
                 status=status,
             )
@@ -697,7 +691,7 @@ def main() -> int:
                 partial_failure = True
     else:
         for node in nodes:
-            storage_meta, volume_usage = get_node_caches(node)
+            storage_meta, volume_sizes = get_node_caches(node)
             try:
                 vms = client.get_vms_for_node(node)
             except Exception as e:
@@ -719,7 +713,7 @@ def main() -> int:
                     storage_meta=storage_meta,
                     resource=resource,
                     backup_jobs=backup_jobs,
-                    volume_usage=volume_usage,
+                    volume_sizes=volume_sizes,
                     verified_at=verified_at,
                     status=status,
                 )
