@@ -17,17 +17,13 @@ from proxmox_inventory_extract import (
     classify_ips,
     extract_ips_from_tags,
     parse_tags,
-    map_status,
     map_os_family,
     total_vcpus,
-    add_tag,
     backup_coverage,
     extract_vm,
     serialize_vm,
     write_csv,
     TEMPLATE_COLUMNS,
-    IP_PREFIX_MAP,
-    MULTI_SEP,
     DiskRecord,
     ProxmoxClient,
 )
@@ -57,11 +53,6 @@ def test_parse_args_full():
     assert args.insecure is True
 
 
-def test_ip_prefix_map_keys():
-    assert IP_PREFIX_MAP["10."] == "backup_ip"
-    assert IP_PREFIX_MAP["172."] == "private_ip"
-    assert IP_PREFIX_MAP["202."] == "public_ip"
-
 
 def test_parse_size_to_gib():
     assert parse_size_to_gib("50G") == 50
@@ -76,46 +67,46 @@ def test_parse_size_to_gib():
 
 def test_parse_disk_value():
     # LVM format
-    lv, size, sid, found = parse_disk_value("vg01:vm-100-disk-0,size=50G")
+    lv, size, sid, volid = parse_disk_value("vg01:vm-100-disk-0,size=50G")
     assert lv == "vm-100-disk-0"
     assert size == 50
     assert sid == "vg01"
-    assert found is True
+    assert volid == "vg01:vm-100-disk-0"
 
     # LVM-thin format
-    lv, size, sid, found = parse_disk_value("local-lvm:vm-101-disk-1,size=100G,format=raw")
+    lv, size, sid, volid = parse_disk_value("local-lvm:vm-101-disk-1,size=100G,format=raw")
     assert lv == "vm-101-disk-1"
     assert size == 100
     assert sid == "local-lvm"
-    assert found is True
+    assert volid == "local-lvm:vm-101-disk-1"
 
     # iSCSI format
-    lv, size, sid, found = parse_disk_value("iscsi0:vm-102-disk-0,size=200G")
+    lv, size, sid, volid = parse_disk_value("iscsi0:vm-102-disk-0,size=200G")
     assert lv == "vm-102-disk-0"
     assert size == 200
     assert sid == "iscsi0"
-    assert found is True
+    assert volid == "iscsi0:vm-102-disk-0"
 
     # Empty
-    lv, size, sid, found = parse_disk_value("")
+    lv, size, sid, volid = parse_disk_value("")
     assert lv == ""
     assert size == 0
     assert sid == ""
-    assert found is False
+    assert volid == ""
 
     # Malformed (no colon)
-    lv, size, sid, found = parse_disk_value("no-colon-here")
+    lv, size, sid, volid = parse_disk_value("no-colon-here")
     assert lv == ""
     assert size == 0
     assert sid == ""
-    assert found is False
+    assert volid == ""
 
     # No size parameter
-    lv, size, sid, found = parse_disk_value("vg01:vm-100-disk-2")
+    lv, size, sid, volid = parse_disk_value("vg01:vm-100-disk-2")
     assert lv == "vm-100-disk-2"
     assert size == 0
     assert sid == "vg01"
-    assert found is False
+    assert volid == "vg01:vm-100-disk-2"
 
 
 def test_parse_disks():
@@ -193,7 +184,7 @@ def test_parse_disks_storage_fallback():
 
     assert len(disks) == 2
     for d in disks:
-        assert d.storage_name == d.storage_id  # fallback
+        assert d.storage_name in ("iscsi0", "ceph0")
         assert d.storage_type in ("iscsi", "rbd")
 
 
@@ -212,15 +203,54 @@ def test_parse_disks_malformed():
     assert set(d.config_key for d in disks) == {"scsi0", "scsi2"}
 
 
+def test_valid_ipv4():
+    from proxmox_inventory_extract import valid_ipv4
+    assert valid_ipv4("10.0.0.5/24") == "10.0.0.5"
+    assert valid_ipv4("999.1.2.3") == ""
+    assert valid_ipv4("127.0.0.1") == ""
+    assert valid_ipv4("fe80::1") == ""
+
+
+def test_config_ips():
+    from proxmox_inventory_extract import config_ips
+    assert config_ips({"ipconfig0": "ip=172.16.5.9/24,gw=172.16.5.1", "ipconfig1": "ip=dhcp"}) == ["172.16.5.9"]
+
+
+def test_config_macs():
+    from proxmox_inventory_extract import config_macs
+    assert config_macs({"net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0"}) == ["aa:bb:cc:dd:ee:ff"]
+
+
 def test_classify_ips():
-    ips = ["10.0.0.1", "10.0.0.2", "172.16.0.1", "202.1.2.3", "192.168.1.1", "8.8.8.8"]
+    ips = ["10.1.1.1", "172.16.5.9", "203.0.113.7"]
     result = classify_ips(ips)
-
-    assert result["backup_ip"] == ["10.0.0.1", "10.0.0.2"]
-    assert result["private_ip"] == ["172.16.0.1", "192.168.1.1", "8.8.8.8"]
-    assert result["public_ip"] == ["202.1.2.3"]
+    assert result == {"backup_ip": ["10.1.1.1"], "private_ip": ["172.16.5.9", "203.0.113.7"]}
+    assert "public_ip" not in result
 
 
+def test_read_arp_table(tmp_path):
+    from proxmox_inventory_extract import read_arp_table
+    arp_file = tmp_path / "arp"
+    arp_file.write_text(
+        "IP address       HW type     Flags       HW address            Mask     Device\n"
+        "192.168.1.50     0x1         0x2         aa:bb:cc:dd:ee:ff     *        vmbr0\n"
+        "192.168.1.51     0x1         0x0         00:00:00:00:00:00     *        vmbr0\n"
+    )
+    res = read_arp_table(str(arp_file))
+    assert res == {"aa:bb:cc:dd:ee:ff": ["192.168.1.50"]}
+
+
+def test_get_ha_vmids():
+    class HaMockClient(ProxmoxClient):
+        def __init__(self):
+            pass
+        def api_get(self, path: str):
+            if path == "/api2/json/cluster/ha/resources":
+                return [{"sid": "vm:100"}, {"sid": "vm:102"}, {"sid": "ct:105"}]
+            return []
+
+    client = HaMockClient()
+    assert client.get_ha_vmids() == {100, 102}
 def test_extract_ips_from_tags():
     tags = "prod;ip=10.0.0.5;web;172.16.0.10;backup"
     ips = extract_ips_from_tags(tags)
@@ -236,23 +266,12 @@ def test_parse_tags():
     assert parse_tags({}) == ""
 
 
-def test_map_status():
-    assert map_status("running") == "running"
-    assert map_status("stopped") == "powered_off"
-    assert map_status("paused") == "unknown"
-    assert map_status("unknown") == "unknown"
-    assert map_status("") == "unknown"
-
 
 def test_map_os_family():
-    # Guest agent takes precedence
-    assert map_os_family("l26", "ubuntu") == "ubuntu"
-    # Fallback to ostype mapping
-    assert map_os_family("l26", None) == "linux"
-    assert map_os_family("w2022", None) == "windows"
-    assert map_os_family("w10", "windows") == "windows"
-    # Unknown ostype defaults to "other"
-    assert map_os_family("unknown", None) == "other"
+    assert map_os_family("l26", "ubuntu") == "linux"
+    assert map_os_family("freebsd", None) == ""
+    assert map_os_family("", "ubuntu") == "linux"
+    assert map_os_family("", "mswindows") == "windows"
     assert map_os_family("", None) == ""
 
 def test_disk_record_csv_field():
@@ -260,7 +279,6 @@ def test_disk_record_csv_field():
         lv_name="vm-100-disk-0",
         config_key="scsi0",
         size_gib=50,
-        storage_id="vg01",
         storage_name="vg01",
         storage_type="lvm",
     )
@@ -282,9 +300,23 @@ def test_template_columns_order():
     assert TEMPLATE_COLUMNS == expected
 
 
-def test_multi_sep():
-    assert MULTI_SEP == ";"
 
+def test_sanitize_row():
+    from proxmox_inventory_extract import sanitize_row
+    row = {
+        "name": "vm1",
+        "platform": "proxmox",
+        "cluster": "c1",
+        "os_family": "bsd",
+        "last_verified_at": "2026-08-27T13:00:00Z",
+        "cpu_cores": "4.0",
+    }
+    warnings = sanitize_row(row)
+    assert len(warnings) == 3
+    assert row["os_family"] == ""
+    assert row["last_verified_at"] == ""
+    assert row["cpu_cores"] == ""
+    assert row["name"] == "vm1"
 
 def test_full_csv_write():
     """Integration test: write CSV and verify header + row structure."""
@@ -328,8 +360,15 @@ def test_full_csv_write():
 def test_total_vcpus():
     assert total_vcpus({"cores": 4, "sockets": 2}) == "8"
     assert total_vcpus({"cores": 2}) == "2"
-    assert total_vcpus({}) == "1"
+    assert total_vcpus({}) == ""
     assert total_vcpus({"cores": 0}) == ""
+
+def test_resource_num():
+    from proxmox_inventory_extract import resource_num
+    assert resource_num({"maxmem": 4294967296}, "maxmem", 1024 * 1024) == "4096"
+    assert resource_num({"maxcpu": 4.0}, "maxcpu") == "4"
+    assert resource_num({}, "maxcpu") == ""
+    assert resource_num({}, "maxmem", 1024 * 1024) == ""
 
 
 def test_backup_coverage():
@@ -344,11 +383,6 @@ def test_backup_coverage():
     assert backup_coverage(pool_jobs, 100, "prod") == ("true", "nfs1")
     assert backup_coverage(pool_jobs, 100, "") == ("false", "")
 
-
-def test_add_tag():
-    assert add_tag("web;prod", "template") == "web;prod;template"
-    assert add_tag("template", "template") == "template"
-    assert add_tag("", "template") == "template"
 
 
 def test_parse_disks_volume_sizes():
@@ -461,8 +495,6 @@ def test_end_to_end_extract_vm():
     volume_sizes = {"local-lvm:vm-100-disk-0": 15}
     backup_jobs = stub.get_backup_jobs()
     resource = stub.get_cluster_vms()[0]
-    verified_at = "2026-08-24T16:00:00Z"
-
     row = extract_vm(
         client=stub,
         node="node1",
@@ -472,7 +504,6 @@ def test_end_to_end_extract_vm():
         resource=resource,
         backup_jobs=backup_jobs,
         volume_sizes=volume_sizes,
-        verified_at=verified_at,
         status="running",
     )
 
@@ -489,7 +520,7 @@ def test_end_to_end_extract_vm():
     assert row["backup_enabled"] == "true"
     assert row["backup_location"] == "pbs-storage"
     assert row["tags"] == "web"
-    assert row["last_verified_at"] == verified_at
+    assert row["last_verified_at"] == ""
     assert row["fqdn"] == "prod-web-01.example.com"
     assert row["os_distribution"] == "Ubuntu 22.04"
     assert row["private_ip"] == "172.16.10.50"
@@ -502,8 +533,6 @@ def test_template_handling():
     volume_sizes = {"local-lvm:vm-100-disk-0": 15}
     backup_jobs = stub.get_backup_jobs()
     resource = stub.get_cluster_vms()[0]
-    verified_at = "2026-08-24T16:00:00Z"
-
     row = extract_vm(
         client=stub,
         node="node1",
@@ -513,7 +542,6 @@ def test_template_handling():
         resource=resource,
         backup_jobs=backup_jobs,
         volume_sizes=volume_sizes,
-        verified_at=verified_at,
         status="running",
     )
 
@@ -537,7 +565,6 @@ def test_header_stability():
         resource=resource,
         backup_jobs=stub.get_backup_jobs(),
         volume_sizes=volume_sizes,
-        verified_at="2026-08-24T16:00:00Z",
         status="running",
     )
     with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
@@ -557,28 +584,28 @@ def test_get_guest_os_version_composition():
             return self.data
 
     # Version + kernel
-    c1 = OsMockClient({
+    c1 = OsMockClient({"result": {
         "id": "ubuntu",
         "pretty-name": "Ubuntu 22.04.3 LTS",
         "version-id": "22.04",
         "kernel-release": "5.15.0-91-generic",
-    })
+    }})
     os1 = c1.get_guest_os("node1", 100)
     assert os1["os_family"] == "ubuntu"
     assert os1["os_distribution"] == "Ubuntu 22.04.3 LTS"
     assert os1["os_version"] == "22.04 (5.15.0-91-generic)"
 
     # Version without kernel (e.g. Windows)
-    c2 = OsMockClient({
+    c2 = OsMockClient({"result": {
         "id": "mswindows",
         "pretty-name": "Windows Server 2022",
         "version-id": "2022",
-    })
+    }})
     os2 = c2.get_guest_os("node1", 100)
     assert os2["os_version"] == "2022"
 
     # Kernel only
-    c3 = OsMockClient({"kernel-release": "6.1.0"})
+    c3 = OsMockClient({"result": {"kernel-release": "6.1.0"}})
     os3 = c3.get_guest_os("node1", 100)
     assert os3["os_version"] == "6.1.0"
 
@@ -597,7 +624,6 @@ def test_extract_vm_agent_gating_agent_disabled():
         resource=resource,
         backup_jobs=stub.get_backup_jobs(),
         volume_sizes=volume_sizes,
-        verified_at="2026-08-24T16:00:00Z",
         status="running",
     )
     assert row is not None
@@ -626,7 +652,6 @@ def test_extract_vm_stopped_vm_never_probes_agent():
         resource=resource,
         backup_jobs=stub.get_backup_jobs(),
         volume_sizes=volume_sizes,
-        verified_at="2026-08-24T16:00:00Z",
         status="stopped",
     )
     assert row is not None
@@ -654,7 +679,6 @@ def test_extract_vm_config_omits_agent_flag():
         resource=resource,
         backup_jobs=stub.get_backup_jobs(),
         volume_sizes=volume_sizes,
-        verified_at="2026-08-24T16:00:00Z",
         status="running",
     )
     assert row is not None
@@ -689,7 +713,7 @@ def test_total_vcpus_defaults():
     assert total_vcpus({"cores": 4}) == "4"
     assert total_vcpus({"cores": 2, "sockets": 2}) == "4"
     assert total_vcpus({"cores": "x"}) == ""
-
+    assert total_vcpus({}) == ""
 
 def test_main_empty_cluster_vms_fallback(monkeypatch, tmp_path):
     from proxmox_inventory_extract import main
@@ -727,7 +751,6 @@ def test_main_empty_cluster_vms_fallback(monkeypatch, tmp_path):
     content = Path(csv_out).read_text()
     assert "vm100" in content
 
-
 def test_resolve_password_empty_env_prompts(monkeypatch):
     from proxmox_inventory_extract import resolve_password
     monkeypatch.setenv("PVE_PASSWORD", "")
@@ -739,6 +762,310 @@ def test_resolve_password_empty_env_prompts(monkeypatch):
     assert resolve_password(Args()) == "prompted_pw"
 
 
+def test_stopped_agentless_vm_multi_source():
+    class StoppedAgentlessStub(StubClient):
+        def __init__(self):
+            pass
+        def get_vm_config(self, node, vmid):
+            return {
+                "name": "app01",
+                "ipconfig0": "ip=172.16.5.9/24",
+                "net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0",
+                "searchdomain": "corp.example.com",
+            }
+        def get_backup_jobs(self):
+            return []
+
+    stub = StoppedAgentlessStub()
+    resource = {"maxcpu": 4.0, "maxmem": 4294967296}
+    row = extract_vm(
+        client=stub,
+        node="node1",
+        vmid=100,
+        cluster_name="prod-cluster",
+        storage_meta={},
+        resource=resource,
+        backup_jobs=[],
+        volume_sizes={},
+        status="stopped",
+        local_node="node1",
+    )
+    assert row is not None
+    assert row["private_ip"] == "172.16.5.9"
+    assert row["backup_ip"] == ""
+    assert row["public_ip"] == ""
+    assert row["fqdn"] == "app01.corp.example.com"
+    assert row["cpu_cores"] == "4"
+    assert row["memory_mb"] == "4096"
+    assert row["status"] == "powered_off"
+    assert row["last_verified_at"] == ""
+
+    # Human-curated columns stay empty
+    human_curated = [
+        "sr_id", "datacenter", "environment", "criticality", "vm_type",
+        "public_ip", "owner", "business_owner", "technical_owner",
+        "applications", "monitoring_enabled", "pmp_enabled",
+        "last_patch_date", "last_vuln_scan_date", "last_verified_at",
+        "decommission_date", "security_remarks",
+    ]
+    for col in human_curated:
+        assert row[col] == "", f"Expected {col} to be empty, got {row[col]!r}"
+
+
 def test_classify_ips_deduplication():
     res = classify_ips(["172.16.0.5", "172.16.0.5"])
     assert res["private_ip"] == ["172.16.0.5"]
+
+
+def test_agent_get_unwraps_result_and_path():
+    class UnwrappingMockClient(ProxmoxClient):
+        def __init__(self, payload):
+            self.payload = payload
+            self.requested_path = None
+        def api_get(self, path: str):
+            self.requested_path = path
+            return self.payload
+
+    c1 = UnwrappingMockClient({"result": {"version": "8.2.2"}})
+    res1 = c1.agent_get("pve", 101, "info")
+    assert res1 == {"version": "8.2.2"}
+    assert c1.requested_path == "/api2/json/nodes/pve/qemu/101/agent/info"
+
+    c2 = UnwrappingMockClient({"version": "8.2.2"})
+    res2 = c2.agent_get("pve", 101, "info")
+    assert res2 == {"version": "8.2.2"}
+
+
+def test_get_guest_fqdn_uses_host_name_key_and_path():
+    class FqdnMockClient(ProxmoxClient):
+        def __init__(self, payload):
+            self.payload = payload
+            self.requested_path = None
+        def api_get(self, path: str):
+            self.requested_path = path
+            return self.payload
+
+    c1 = FqdnMockClient({"result": {"host-name": "web01.corp.example"}})
+    fqdn1 = c1.get_guest_fqdn("pve", 101)
+    assert fqdn1 == "web01.corp.example"
+    assert c1.requested_path == "/api2/json/nodes/pve/qemu/101/agent/get-host-name"
+
+    c2 = FqdnMockClient({"result": {"host-name": "workStation"}})
+    fqdn2 = c2.get_guest_fqdn("pve", 101)
+    assert fqdn2 is None
+
+
+def test_get_guest_ips_unwraps_result():
+    class IpsMockClient(ProxmoxClient):
+        def __init__(self, payload):
+            self.payload = payload
+        def api_get(self, path: str):
+            return self.payload
+
+    payload = {
+        "result": [
+            {
+                "name": "lo",
+                "ip-addresses": [
+                    {"ip-address": "127.0.0.1"},
+                    {"ip-address": "::1"},
+                ],
+            },
+            {
+                "name": "ens18",
+                "ip-addresses": [
+                    {"ip-address": "192.168.0.17"},
+                    {"ip-address": "fe80::4c4a:aab9:505f:af94"},
+                ],
+            },
+        ]
+    }
+    c = IpsMockClient(payload)
+    ips = c.get_guest_ips("pve", 101)
+    assert ips == ["192.168.0.17"]
+def test_ostype_family_win_prefix():
+    from proxmox_inventory_extract import map_os_family
+    assert map_os_family("win11", None) == "windows"
+    assert map_os_family("win10", None) == "windows"
+    assert map_os_family("win2022", None) == "windows"
+
+
+def test_parse_disks_sorted_keys():
+    from proxmox_inventory_extract import parse_disks
+    config = {
+        "scsi1": "local-lvm:vm-100-disk-1,size=20G",
+        "efidisk0": "local-lvm:vm-100-disk-0,size=1M",
+        "scsi0": "local-lvm:vm-100-disk-0,size=10G",
+    }
+    disks = parse_disks(config, {}, {})
+    keys = [d.config_key for d in disks]
+    assert keys == ["efidisk0", "scsi0", "scsi1"]
+
+
+def test_main_no_probe_option(tmp_path, monkeypatch):
+    import sys
+    from proxmox_inventory_extract import main, ProxmoxClient
+
+    class StubClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        def get_ticket(self):
+            pass
+        def get_cluster_name(self):
+            return "standalone"
+        def get_nodes(self):
+            return ["node1"]
+        def get_backup_jobs(self):
+            return []
+        def get_ha_vmids(self):
+            return set()
+        def get_storage_config(self, node):
+            return []
+        def get_storage_content(self, node, sid):
+            return []
+        def get_cluster_vms(self):
+            return [{"vmid": 100, "node": "node1", "status": "running"}]
+        def get_vm_config(self, node, vmid):
+            return {"name": "test-vm", "cores": 1, "memory": 512}
+        def get_agent_info(self, node, vmid):
+            return None
+
+    monkeypatch.setattr("proxmox_inventory_extract.ProxmoxClient", StubClient)
+    out_csv = str(tmp_path / "out.csv")
+    monkeypatch.setattr(sys, "argv", ["script", "--no-probe", "-o", out_csv, "-p", "pass"])
+    ret = main()
+    assert ret == 0
+    assert (tmp_path / "out.csv").exists()
+
+
+def test_live_pve_host_payload_end_to_end(tmp_path, monkeypatch):
+    """Exact live API payloads from Proxmox VE 9.2.10 host (192.168.0.5)."""
+    import sys
+    from proxmox_inventory_extract import main, ProxmoxClient, sanitize_row, TEMPLATE_COLUMNS
+    import csv
+
+    LIVE_ENDPOINTS = {
+        "/api2/json/cluster/status": [
+            {"id": "node/pve", "ip": "192.168.0.5", "level": "", "local": 1, "name": "pve", "nodeid": 0, "online": 1, "type": "node"}
+        ],
+        "/api2/json/nodes": [
+            {"node": "pve", "status": "online"}
+        ],
+        "/api2/json/cluster/ha/resources": [],
+        "/api2/json/cluster/backup": [],
+        "/api2/json/cluster/resources?type=vm": [
+            {"id": "lxc/100", "name": "adguard", "node": "pve", "status": "running", "type": "lxc", "vmid": 100, "template": 0},
+            {"id": "qemu/101", "name": "work-station", "node": "pve", "status": "running", "type": "qemu", "vmid": 101, "template": 0, "maxcpu": 6, "maxmem": 4294967296}
+        ],
+        "/api2/json/nodes/pve/storage": [
+            {"active": 1, "storage": "local", "type": "dir", "content": "backup,iso,snippets,vztmpl,rootdir"},
+            {"active": 1, "storage": "local-lvm", "type": "lvmthin", "content": "images,rootdir"},
+            {"active": 1, "storage": "ZPOOL", "type": "zfspool", "content": "rootdir,images"}
+        ],
+        "/api2/json/nodes/pve/storage/local/content?content=images": [],
+        "/api2/json/nodes/pve/storage/local-lvm/content?content=images": [],
+        "/api2/json/nodes/pve/storage/ZPOOL/content?content=images": [
+            {"content": "rootdir", "format": "subvol", "name": "subvol-100-disk-0", "size": 1073741824, "vmid": 100, "volid": "ZPOOL:subvol-100-disk-0"},
+            {"content": "images", "format": "raw", "name": "vm-101-disk-0", "size": 1048576, "vmid": 101, "volid": "ZPOOL:vm-101-disk-0"},
+            {"content": "images", "format": "raw", "name": "vm-101-disk-1", "size": 536870912000, "vmid": 101, "volid": "ZPOOL:vm-101-disk-1"}
+        ],
+        "/api2/json/nodes/pve/qemu/101/config": {
+            "agent": "1",
+            "bios": "ovmf",
+            "boot": "order=scsi0;ide2;net0",
+            "cores": 3,
+            "cpu": "x86-64-v2-AES",
+            "efidisk0": "ZPOOL:vm-101-disk-0,efitype=4m,size=1M",
+            "ide2": "local:iso/debian-13.6.0-amd64-netinst.iso,media=cdrom,size=755M",
+            "memory": "4096",
+            "name": "work-station",
+            "net0": "virtio=BC:24:11:F0:25:EB,bridge=vmbr0,firewall=1",
+            "ostype": "l26",
+            "scsi0": "ZPOOL:vm-101-disk-1,discard=on,iothread=1,size=500G",
+            "scsihw": "virtio-scsi-single",
+            "sockets": 2
+        },
+        "/api2/json/nodes/pve/qemu/101/agent/info": {
+            "result": {
+                "version": "10.0.11",
+                "supported_commands": [{"enabled": True, "name": "guest-get-osinfo", "success-response": True}]
+            }
+        },
+        "/api2/json/nodes/pve/qemu/101/agent/get-osinfo": {
+            "result": {
+                "id": "debian",
+                "kernel-release": "6.12.101+deb13-amd64",
+                "name": "Debian GNU/Linux",
+                "pretty-name": "Debian GNU/Linux 13 (trixie)",
+                "version": "13 (trixie)",
+                "version-id": "13"
+            }
+        },
+        "/api2/json/nodes/pve/qemu/101/agent/get-host-name": {
+            "result": {
+                "host-name": "workStation"
+            }
+        },
+        "/api2/json/nodes/pve/qemu/101/agent/network-get-interfaces": {
+            "result": [
+                {
+                    "name": "lo",
+                    "ip-addresses": [
+                        {"ip-address": "127.0.0.1", "ip-address-type": "ipv4", "prefix": 8},
+                        {"ip-address": "::1", "ip-address-type": "ipv6", "prefix": 128}
+                    ]
+                },
+                {
+                    "name": "ens18",
+                    "hardware-address": "bc:24:11:f0:25:eb",
+                    "ip-addresses": [
+                        {"ip-address": "192.168.0.17", "ip-address-type": "ipv4", "prefix": 24},
+                        {"ip-address": "fe80::4c4a:aab9:505f:af94", "ip-address-type": "ipv6", "prefix": 64}
+                    ]
+                }
+            ]
+        }
+    }
+
+    class LiveMockClient(ProxmoxClient):
+        def __init__(self, *args, **kwargs):
+            pass
+        def get_ticket(self):
+            pass
+        def api_get(self, path: str):
+            if path in LIVE_ENDPOINTS:
+                return LIVE_ENDPOINTS[path]
+            raise AssertionError(f"Unexpected path requested: {path}")
+
+    monkeypatch.setattr("proxmox_inventory_extract.ProxmoxClient", LiveMockClient)
+    out_csv = str(tmp_path / "live-mock.csv")
+    monkeypatch.setattr(sys, "argv", ["script", "--insecure", "-H", "127.0.0.1:8006", "-o", out_csv, "-p", "dummy"])
+
+    ret = main()
+    assert ret == 0
+
+    with open(out_csv) as f:
+        reader = csv.DictReader(f)
+        hdr = tuple(reader.fieldnames or [])
+        assert hdr == TEMPLATE_COLUMNS
+        rows = list(reader)
+
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["name"] == "work-station"
+    assert r["external_id"] == "101"
+    assert r["platform"] == "proxmox"
+    assert r["node"] == "pve"
+    assert r["cluster"] == "standalone"
+    assert r["status"] == "running"
+    assert r["cpu_cores"] == "6"
+    assert r["memory_mb"] == "4096"
+    assert r["disks"] == "vm-101-disk-0-efidisk0:1:ZPOOL:zfspool;vm-101-disk-1-scsi0:500:ZPOOL:zfspool"
+    assert r["os_family"] == "linux"
+    assert r["os_distribution"] == "Debian GNU/Linux 13 (trixie)"
+    assert r["os_version"] == "13 (6.12.101+deb13-amd64)"
+    assert r["private_ip"] == "192.168.0.17"
+    assert r["fqdn"] == ""
+    assert r["ha_enabled"] == "false"
+    assert r["backup_enabled"] == "false"
+    assert sanitize_row(dict(r)) == []

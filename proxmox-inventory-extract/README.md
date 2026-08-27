@@ -30,8 +30,7 @@ export PVE_PASSWORD="your-root-password"
 
 ## Output CSV Schema
 
-Matches InventoryMGR's `TEMPLATE_COLUMNS` exactly (35 columns in fixed order):
-
+Matches InventoryMGR's `TEMPLATE_COLUMNS` exactly (39 columns in fixed order):
 | Column | Source |
 |--------|--------|
 | `name` | VM config `name` |
@@ -74,7 +73,7 @@ Matches InventoryMGR's `TEMPLATE_COLUMNS` exactly (35 columns in fixed order):
 | `security_remarks` | *(empty — not available from Proxmox)* |
 | `description` | Proxmox VM config `description` field verbatim |
 
-All 35 InventoryMGR columns are emitted; unused columns are empty strings.
+All 39 InventoryMGR columns are emitted; unused columns are empty strings.
 
 ## Disk Format (Updated)
 
@@ -100,7 +99,7 @@ vm-100-disk-0-scsi0:50:vg01:lvm;vm-100-disk-1-scsi1:100:vg01:lvm;vm-100-disk-2-v
 **Key changes from previous version:**
 - Per-disk `storage_name` and `storage_type` fields (no longer plugin-prefixed in disk name)
 - `vgname` preferred; falls back to Proxmox storage ID
-- EFI and TPM disks included (size may be 0 GiB if < 1 GiB)
+- EFI and TPM disks included (sub-GiB non-zero sizes round up to 1 GiB)
 - CDROM (`media=cdrom`) and `none` entries skipped
 
 ## IP Classification
@@ -184,24 +183,23 @@ The contract test:
 - Reports `[PASS]` with row count on success
 - See `contract_test.py` for details
 
-**InventoryMGR compatibility:** Tested against `origin/main` commit `ea6f8b6` (2026-08-15). The `csv_import_parsing` module exists only in that branch.
+**InventoryMGR compatibility:** Uses `app.services.csv_import` module from InventoryMGR backend.
 
 ## How It Works
 
 1. **Authenticate** — POST `/api2/json/access/ticket` with username/password
 2. **Get cluster status** — `/api2/json/cluster/status` for cluster name
 3. **Enumerate nodes** — `/api2/json/nodes` (online only)
-4. **Enumerate VMs per node** — `/api2/json/nodes/<node>/qemu`
+4. **Enumerate QEMU VMs per node** — `/api2/json/nodes/<node>/qemu` (LXC containers are excluded)
 5. **Get VM config** — `/api2/json/nodes/<node>/qemu/<vmid>/config`
 6. **Get storage config** — `/api2/json/nodes/<node>/storage` (for `vgname`/`type`)
 7. **Get guest agent info** (if agent enabled):
    - `/api2/json/nodes/<node>/qemu/<vmid>/agent/network-get-interfaces`
    - `/api2/json/nodes/<node>/qemu/<vmid>/agent/get-osinfo`
-   - `/api2/json/nodes/<node>/qemu/<vmid>/agent/get-hostname`
+   - `/api2/json/nodes/<node>/qemu/<vmid>/agent/get-host-name`
 8. **Parse disks** — extract LV name, size, storage from config keys (`scsi*`, `virtio*`, `sata*`, `ide*`, `efidisk*`, `tpmstate*`)
 9. **Build CSV row** — map all fields to InventoryMGR `TEMPLATE_COLUMNS` order
-10. **Write CSV** — emit all 35 columns in correct order
-
+10. **Write CSV** — emit all 39 columns in correct order
 ## Special Handling
 
 ### Disk Parsing

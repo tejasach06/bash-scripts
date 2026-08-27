@@ -11,9 +11,12 @@ import argparse
 import csv
 import dataclasses
 import datetime
+import glob
+import ipaddress
 import json
 import os
 import re
+import socket
 import ssl
 import sys
 import urllib.parse
@@ -31,22 +34,12 @@ TEMPLATE_COLUMNS = (
     "decommission_date", "security_remarks", "description",
 )
 
-# IP prefix → InventoryMGR column. First match in declaration order wins.
-IP_PREFIX_MAP = {
-    "10.":  "backup_ip",
-    "172.": "private_ip",
-    "202.": "public_ip",
-}
-
-# Proxmox ostype values that map to OS family.
-OSTYPE_FAMILY = {
-    "l24": "linux", "l26": "linux",
-    "wxp": "windows", "w2k": "windows", "w2k3": "windows",
-    "w2k8": "windows", "wvista": "windows", "w7": "windows",
-    "w8": "windows", "w10": "windows", "w11": "windows",
-    "w2008": "windows", "w2012": "windows", "w2016": "windows",
-    "w2019": "windows", "w2022": "windows",
-    "solaris": "solaris", "openbsd": "bsd", "freebsd": "bsd", "netbsd": "bsd",
+# Guest-agent os ids that are Linux distributions. Agent ids outside this set
+# are matched by the windows keyword check, then give up (blank).
+AGENT_LINUX_IDS = {
+    "alpine", "almalinux", "amzn", "arch", "centos", "debian", "fedora",
+    "gentoo", "linuxmint", "ol", "opensuse", "opensuse-leap",
+    "opensuse-tumbleweed", "rhel", "rocky", "sles", "suse", "ubuntu",
 }
 
 # Supported disk config key regex in Proxmox VM config
@@ -57,16 +50,60 @@ STATUS_MAP = {
     "running": "running",
     "stopped": "powered_off",
 }
-
 MULTI_SEP = ";"
 API_TIMEOUT = 30  # seconds, per HTTP request
 
+ENUM_COLUMNS = {
+    "status": {"running", "powered_off", "decommissioned", "unknown"},
+    "environment": {"production", "development", "testing", "uat", "dr", "staging", "sandbox"},
+    "criticality": {"low", "medium", "high", "critical"},
+    "os_family": {"linux", "windows"},
+    "vm_type": {"permanent", "temporary"},
+}
+BOOL_COLUMNS = ("monitoring_enabled", "pmp_enabled", "ha_enabled", "backup_enabled")
+INT_COLUMNS = ("cpu_cores", "memory_mb")
+DATE_COLUMNS = ("last_patch_date", "last_vuln_scan_date", "last_verified_at", "decommission_date")
+REQUIRED_COLUMNS = ("name", "platform", "cluster")
+ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def sanitize_row(row: dict[str, str]) -> list[str]:
+    """Blank any cell InventoryMGR's importer would reject; return warnings."""
+    warnings = []
+    for col, valid_set in ENUM_COLUMNS.items():
+        val = row.get(col, "")
+        if val and val not in valid_set:
+            warnings.append(f"{col} '{val}' not importable, blanked")
+            row[col] = ""
+
+    for col in BOOL_COLUMNS:
+        val = row.get(col, "")
+        if val and val.lower() not in {"true", "false", "yes", "no", "1", "0"}:
+            warnings.append(f"{col} '{val}' not a valid boolean, blanked")
+            row[col] = ""
+
+    for col in INT_COLUMNS:
+        val = row.get(col, "")
+        if val and not (val.isdigit() and int(val) >= 0):
+            warnings.append(f"{col} '{val}' not a valid integer >= 0, blanked")
+            row[col] = ""
+
+    for col in DATE_COLUMNS:
+        val = row.get(col, "")
+        if val and not ISO_DATE_RE.match(val):
+            warnings.append(f"{col} '{val}' not a valid ISO date YYYY-MM-DD, blanked")
+            row[col] = ""
+
+    for col in REQUIRED_COLUMNS:
+        if not row.get(col, ""):
+            warnings.append(f"{col} is blank; InventoryMGR will reject this row")
+
+    return warnings
 @dataclasses.dataclass
 class DiskRecord:
     lv_name: str
     config_key: str
     size_gib: int
-    storage_id: str
     storage_name: str
     storage_type: str
 
@@ -87,6 +124,7 @@ class ProxmoxClient:
     timeout: int = API_TIMEOUT
     ticket: str = ""
     csrf: str = ""
+    _ctx: Optional[ssl.SSLContext] = None
     def get_ticket(self) -> None:
         url = f"https://{self.host}/api2/json/access/ticket"
         data = urllib.parse.urlencode({"username": self.user, "password": self.password}).encode()
@@ -98,11 +136,12 @@ class ProxmoxClient:
         self.csrf = body["data"]["CSRFPreventionToken"]
 
     def _ssl_context(self) -> ssl.SSLContext:
-        ctx = ssl.create_default_context()
-        if not self.verify_ssl:
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-        return ctx
+        if self._ctx is None:
+            self._ctx = ssl.create_default_context()
+            if not self.verify_ssl:
+                self._ctx.check_hostname = False
+                self._ctx.verify_mode = ssl.CERT_NONE
+        return self._ctx
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -150,20 +189,43 @@ class ProxmoxClient:
     def get_backup_jobs(self) -> list[dict]:
         return self.api_get("/api2/json/cluster/backup")
 
+    def get_ha_vmids(self) -> set[int]:
+        """VMIDs managed by HA, from /cluster/ha/resources (sid like 'vm:100')."""
+        try:
+            data = self.api_get("/api2/json/cluster/ha/resources")
+        except Exception:
+            return set()
+        vmids = set()
+        if isinstance(data, list):
+            for entry in data:
+                sid = str(entry.get("sid", ""))
+                if sid.startswith("vm:"):
+                    v_str = sid[3:]
+                    if v_str.isdigit():
+                        vmids.add(int(v_str))
+        return vmids
+    def agent_get(self, node: str, vmid: int, command: str) -> Any:
+        """GET a guest-agent command. PVE wraps qemu-ga output as
+        {"data": {"result": ...}}; bare payloads are passed through unchanged."""
+        data = self.api_get(f"/api2/json/nodes/{node}/qemu/{vmid}/agent/{command}")
+        if isinstance(data, dict) and "result" in data:
+            return data["result"]
+        return data
+
     def get_guest_ips(self, node: str, vmid: int) -> list[str]:
-        data = self.api_get(f"/api2/json/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces")
+        data = self.agent_get(node, vmid, "network-get-interfaces")
         ips: list[str] = []
         if not data:
             return ips
         for iface in data:
             for entry in iface.get("ip-addresses", []) or []:
-                ip = entry.get("ip-address", "")
-                if ip and not ip.startswith("127.") and not ip.startswith("169.254.") and ":" not in ip:
+                ip = valid_ipv4(entry.get("ip-address", ""))
+                if ip and ip not in ips:
                     ips.append(ip)
         return ips
 
     def get_guest_os(self, node: str, vmid: int) -> dict[str, Optional[str]]:
-        data = self.api_get(f"/api2/json/nodes/{node}/qemu/{vmid}/agent/get-osinfo")
+        data = self.agent_get(node, vmid, "get-osinfo")
         if not data:
             return {"os_family": None, "os_distribution": None, "os_version": None}
         version = data.get("version-id") or data.get("version") or None
@@ -179,17 +241,17 @@ class ProxmoxClient:
         }
 
     def get_guest_fqdn(self, node: str, vmid: int) -> Optional[str]:
-        data = self.api_get(f"/api2/json/nodes/{node}/qemu/{vmid}/agent/get-hostname")
+        data = self.agent_get(node, vmid, "get-host-name")
         if not data:
             return None
-        hostname = data.get("hostname") or data.get("name") or ""
-        if hostname and not hostname.startswith("localhost"):
+        hostname = data.get("host-name") or data.get("hostname") or ""
+        if hostname and "." in hostname and not hostname.startswith("localhost"):
             return hostname
         return None
 
     def get_agent_info(self, node: str, vmid: int) -> Optional[dict]:
         """qemu-ga probe. Returns agent info dict when the agent answers, else None."""
-        data = self.api_get(f"/api2/json/nodes/{node}/qemu/{vmid}/agent/info")
+        data = self.agent_get(node, vmid, "info")
         if isinstance(data, dict) and data.get("version"):
             return data
         return None
@@ -207,6 +269,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--insecure", action="store_true", help="Disable TLS cert verification")
     parser.add_argument("--version", action="version", version="proxmox-inventory-extract 2026-08-15")
     parser.add_argument("--timeout", type=int, default=API_TIMEOUT, help="Per-request HTTP timeout in seconds")
+    parser.add_argument("--no-probe", action="store_true", help="Disable reverse DNS and local ARP/DHCP lease lookups")
+    parser.add_argument("--probe-timeout", type=float, default=2.0, help="Reverse DNS timeout in seconds")
     return parser.parse_args(argv)
 
 
@@ -263,7 +327,8 @@ def build_volume_sizes(client: ProxmoxClient, node: str, storage_ids: list[str])
 def parse_disks(config: dict, storage_meta: dict, volume_sizes: dict[str, int]) -> list[DiskRecord]:
     """Parse all supported disk config keys into structured DiskRecord list."""
     disks: list[DiskRecord] = []
-    for key, value in config.items():
+    for key in sorted(config.keys()):
+        value = config[key]
         if not DISK_KEY_RE.match(key):
             continue
         if not value or value == "none":
@@ -271,9 +336,9 @@ def parse_disks(config: dict, storage_meta: dict, volume_sizes: dict[str, int]) 
         if isinstance(value, str) and "media=cdrom" in value:
             continue
 
-        lv_name, provisioned_size_gib, storage_id, size_found = parse_disk_value(value)
-        volid = str(value).split(",")[0]
-        size_gib = provisioned_size_gib if size_found else volume_sizes.get(volid, 0)
+        lv_name, size_gib, storage_id, volid = parse_disk_value(value)
+        if not size_gib:
+            size_gib = volume_sizes.get(volid, 0)
 
         if not lv_name:
             print(f"[warn] Skipping malformed disk {key}={value}", file=sys.stderr)
@@ -287,36 +352,24 @@ def parse_disks(config: dict, storage_meta: dict, volume_sizes: dict[str, int]) 
             lv_name=lv_name,
             config_key=key,
             size_gib=size_gib,
-            storage_id=storage_id,
             storage_name=storage_name,
             storage_type=storage_type,
         ))
     return disks
 
-def parse_disk_value(value: str) -> tuple[str, int, str, bool]:
-    """Parse Proxmox disk config value into (lv_name, size_gib, storage_id, size_found)."""
-    if not value:
-        return "", 0, "", False
+def parse_disk_value(value: str) -> tuple[str, int, str, str]:
+    """Parse a Proxmox disk config value into (lv_name, size_gib, storage_id, volid).
 
-    parts = value.split(",")
+    size_gib is 0 when the config carries no size= (caller falls back to storage content).
+    """
+    parts = str(value or "").split(",")
     main = parts[0]
-    if ":" not in main:
-        return "", 0, "", False
-
+    if not main or ":" not in main:
+        return "", 0, "", ""
     storage_id, volume = main.split(":", 1)
-    lv_name = volume.split("/")[-1]
-
-    size_gib = 0
-    size_found = False
-    for part in parts[1:]:
-        part = part.strip()
-        if part.startswith("size="):
-            size_str = part[5:]
-            size_gib = parse_size_to_gib(size_str)
-            size_found = True
-            break
-
-    return lv_name, size_gib, storage_id, size_found
+    size_gib = next((parse_size_to_gib(p.strip()[5:]) for p in parts[1:]
+                     if p.strip().startswith("size=")), 0)
+    return volume.split("/")[-1], size_gib, storage_id, main
 
 
 _UNIT_BYTES = {"": 1, "B": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
@@ -334,19 +387,149 @@ def parse_size_to_gib(size_str: str) -> int:
     return max(1, int(total // (1024 ** 3)))
 
 
+def valid_ipv4(value: str) -> str:
+    """Canonical IPv4 string, or '' when the value is not a usable address.
+
+    Strips a /CIDR suffix; rejects loopback, link-local, multicast,
+    unspecified and IPv6, matching what the guest-agent path already filters.
+    """
+    val = (value or "").strip().split("/", 1)[0].strip()
+    if not val:
+        return ""
+    try:
+        ip = ipaddress.ip_address(val)
+    except ValueError:
+        return ""
+    if ip.version != 4:
+        return ""
+    if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+        return ""
+    return str(ip)
+
+
+def config_ips(config: dict) -> list[str]:
+    """IPv4 addresses declared in cloud-init ipconfigN keys (ip=10.0.0.5/24)."""
+    ips = []
+    keys = sorted(
+        [k for k in config if re.match(r"^ipconfig\d+$", k)],
+        key=lambda k: int(k[8:])
+    )
+    for k in keys:
+        val = str(config[k])
+        for part in val.split(","):
+            part = part.strip()
+            if part.startswith("ip="):
+                raw_ip = part[3:]
+                if raw_ip.lower() == "dhcp":
+                    continue
+                v_ip = valid_ipv4(raw_ip)
+                if v_ip and v_ip not in ips:
+                    ips.append(v_ip)
+    return ips
+
+
+def config_macs(config: dict) -> list[str]:
+    """Lowercase MACs from netN keys, e.g. 'virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0'."""
+    macs = []
+    mac_re = re.compile(r"\b([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})\b")
+    keys = sorted(
+        [k for k in config if re.match(r"^net\d+$", k)],
+        key=lambda k: int(k[3:])
+    )
+    for k in keys:
+        val = str(config[k])
+        m = mac_re.search(val)
+        if m:
+            mac = m.group(1).lower()
+            if mac not in macs:
+                macs.append(mac)
+    return macs
+
+
 def classify_ips(ips: list[str]) -> dict[str, list[str]]:
-    """Classify IPs by prefix map into InventoryMGR role columns."""
-    result = {"private_ip": [], "public_ip": [], "backup_ip": []}
-    for ip in dict.fromkeys(ips):
-        matched = False
-        for prefix, column in IP_PREFIX_MAP.items():
-            if ip.startswith(prefix):
-                result[column].append(ip)
-                matched = True
-                break
-        if not matched:
-            result["private_ip"].append(ip)
+    """10/8 is the backup network; every other usable IPv4 is private. public_ip stays human-curated."""
+    result = {"private_ip": [], "backup_ip": []}
+    for raw_ip in dict.fromkeys(ips):
+        ip = valid_ipv4(raw_ip)
+        if not ip:
+            continue
+        result["backup_ip" if ip.startswith("10.") else "private_ip"].append(ip)
     return result
+ARP_PATH = "/proc/net/arp"
+DNSMASQ_LEASE_GLOBS = ("/var/lib/misc/dnsmasq.*.leases", "/var/lib/dnsmasq/*.leases")
+
+
+def read_arp_table(path: str = ARP_PATH) -> dict[str, list[str]]:
+    """mac (lowercase) -> IPv4s from /proc/net/arp, skipping incomplete (flags 0x0) rows."""
+    res: dict[str, list[str]] = {}
+    if not os.path.isfile(path):
+        return res
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return res
+    for line in lines[1:]:  # skip header
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        ip_raw, flags_raw, mac_raw = parts[0], parts[2], parts[3]
+        if flags_raw == "0x0":
+            continue
+        v_ip = valid_ipv4(ip_raw)
+        mac = mac_raw.lower()
+        if v_ip and mac and mac != "00:00:00:00:00:00":
+            if mac not in res:
+                res[mac] = []
+            if v_ip not in res[mac]:
+                res[mac].append(v_ip)
+    return res
+
+
+def read_dhcp_leases(globs: tuple[str, ...] = DNSMASQ_LEASE_GLOBS) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """(mac -> IPv4s, mac -> hostname) from dnsmasq leases: 'expiry mac ip hostname clientid'."""
+    mac_to_ips: dict[str, list[str]] = {}
+    mac_to_host: dict[str, str] = {}
+    seen_files: set[str] = set()
+    for g in globs:
+        for filepath in glob.glob(g):
+            if filepath in seen_files:
+                continue
+            seen_files.add(filepath)
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+            except Exception as e:
+                print(f"[warn] Failed to read lease file {filepath}: {e}", file=sys.stderr)
+                continue
+            for line in lines:
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                mac_raw, ip_raw, host_raw = parts[1], parts[2], parts[3]
+                mac = mac_raw.lower()
+                v_ip = valid_ipv4(ip_raw)
+                if v_ip and mac:
+                    if mac not in mac_to_ips:
+                        mac_to_ips[mac] = []
+                    if v_ip not in mac_to_ips[mac]:
+                        mac_to_ips[mac].append(v_ip)
+                if host_raw and host_raw != "*" and mac and "." in host_raw and not host_raw.startswith("localhost"):
+                    mac_to_host[mac] = host_raw
+    return mac_to_ips, mac_to_host
+
+
+def reverse_dns(ip: str) -> str:
+    """PTR name for ip when it is a dotted non-localhost name, else ''."""
+    if not ip:
+        return ""
+    try:
+        name = socket.gethostbyaddr(ip)[0]
+    except (OSError, IndexError):
+        return ""
+    if name and "." in name and not name.startswith("localhost"):
+        return name
+    return ""
 
 
 def extract_ips_from_tags(tags: str) -> list[str]:
@@ -365,14 +548,25 @@ def parse_tags(config: dict) -> str:
     return MULTI_SEP.join(t.strip() for t in raw.split(";") if t.strip())
 
 
-def map_status(proxmox_status: str) -> str:
-    return STATUS_MAP.get(proxmox_status, "unknown")
+def resource_num(resource: dict, key: str, divisor: int = 1) -> str:
+    """Positive integer from a cluster/resources field, floor-divided by divisor, else ''."""
+    val = resource.get(key)
+    if val is None or val == "":
+        return ""
+    try:
+        num = int(float(val)) // divisor
+    except (TypeError, ValueError):
+        return ""
+    return str(num) if num > 0 else ""
+
 
 def total_vcpus(config: dict) -> str:
-    """Proxmox vCPU count = cores * sockets; both default to 1."""
+    """Proxmox vCPU count = cores * sockets; both default to 1 when at least one is present."""
+    c_val = config.get("cores")
+    s_val = config.get("sockets")
+    if c_val is None and s_val is None:
+        return ""
     try:
-        c_val = config.get("cores")
-        s_val = config.get("sockets")
         cores = int(1 if c_val is None or c_val == "" else c_val)
         sockets = int(1 if s_val is None or s_val == "" else s_val)
     except (TypeError, ValueError):
@@ -381,23 +575,26 @@ def total_vcpus(config: dict) -> str:
         return ""
     return str(cores * sockets)
 
+def map_os_family(ostype: str, guest_os_family: Optional[str]) -> str:
+    """InventoryMGR os_family ('linux' | 'windows' | '').
 
-
-def map_os_family(ostype: str, guest_os_family: Optional[str]) -> Optional[str]:
-    if guest_os_family:
-        return guest_os_family
-    if ostype in OSTYPE_FAMILY:
-        return OSTYPE_FAMILY[ostype]
-    if ostype:
-        return "other"
+    Proxmox ostype values are l24/l26 (linux), w*/win* (windows), and
+    solaris/other/*bsd (unmappable). The guest-agent id only resolves a
+    missing ostype.
+    """
+    ot = (ostype or "").lower()
+    if ot.startswith("l"):
+        return "linux"
+    if ot.startswith("w"):
+        return "windows"
+    if ot:
+        return ""  # solaris, other, *bsd: not importable
+    g_fam = (guest_os_family or "").lower()
+    if g_fam in AGENT_LINUX_IDS:
+        return "linux"
+    if "windows" in g_fam or "mswin" in g_fam:
+        return "windows"
     return ""
-
-
-def add_tag(tags: str, tag: str) -> str:
-    parts = [t for t in tags.split(MULTI_SEP) if t]
-    if tag not in parts:
-        parts.append(tag)
-    return MULTI_SEP.join(parts)
 
 
 def backup_coverage(jobs: list[dict], vmid: int, pool: str) -> tuple[str, str]:
@@ -447,32 +644,31 @@ def serialize_vm(
     resource: dict,
     backup_enabled: str,
     backup_location: str,
-    verified_at: str,
+    ha_vmids: Optional[set[int]] = None,
 ) -> dict[str, str]:
     """Map internal VM data to InventoryMGR CSV row (all TEMPLATE_COLUMNS)."""
     row = {col: "" for col in TEMPLATE_COLUMNS}
 
     # Identity
-    row["name"] = config.get("name", f"vm-{vmid}")
+    row["name"] = config.get("name") or resource.get("name") or f"vm-{vmid}"
     row["external_id"] = str(vmid)
     row["fqdn"] = fqdn or ""
     row["sr_id"] = ""
     row["platform"] = "proxmox"
-
     # Placement
     row["datacenter"] = ""
     row["cluster"] = cluster_name
     row["node"] = node
 
     # Classification
-    row["status"] = map_status(status)
+    row["status"] = STATUS_MAP.get(status, "unknown")
     row["environment"] = ""
     row["criticality"] = ""
     row["vm_type"] = ""
 
     # Capacity
-    row["cpu_cores"] = total_vcpus(config)
-    row["memory_mb"] = str(config.get("memory", ""))
+    row["cpu_cores"] = total_vcpus(config) or resource_num(resource, "maxcpu")
+    row["memory_mb"] = str(config.get("memory") or "") or resource_num(resource, "maxmem", 1024 * 1024)
     row["disks"] = MULTI_SEP.join(d.to_csv_field() for d in disks)
     row["storage_name"] = ""  # per-disk storage in disks column
     row["storage_type"] = ""
@@ -485,8 +681,7 @@ def serialize_vm(
 
     # Network
     row["private_ip"] = MULTI_SEP.join(ips_by_role["private_ip"])
-    row["public_ip"] = MULTI_SEP.join(ips_by_role["public_ip"])
-    row["backup_ip"] = MULTI_SEP.join(ips_by_role["backup_ip"])
+    row["backup_ip"] = MULTI_SEP.join(ips_by_role.get("backup_ip", []))
 
     # Ownership
     row["owner"] = ""
@@ -497,17 +692,18 @@ def serialize_vm(
     # Operations
     row["monitoring_enabled"] = ""
     row["pmp_enabled"] = ""
-    row["ha_enabled"] = "true" if resource.get("hastate") else "false"
+    row["ha_enabled"] = "true" if (resource.get("hastate") or (ha_vmids and vmid in ha_vmids)) else "false"
     row["backup_enabled"] = backup_enabled
     row["backup_location"] = backup_location
-    if resource.get("template") == 1 or resource.get("template") == "1":
-        tags = add_tag(tags, "template")
-    row["tags"] = tags
+    parts = [t for t in tags.split(MULTI_SEP) if t]
+    if str(resource.get("template", "")) == "1" and "template" not in parts:
+        parts.append("template")
+    row["tags"] = MULTI_SEP.join(parts)
 
     # Compliance dates
     row["last_patch_date"] = ""
     row["last_vuln_scan_date"] = ""
-    row["last_verified_at"] = verified_at
+    row["last_verified_at"] = ""
     row["decommission_date"] = ""
 
     # Notes
@@ -518,11 +714,13 @@ def serialize_vm(
 
 
 def write_csv(rows: list[dict], output_path: str) -> None:
+    for row in rows:
+        for warning in sanitize_row(row):
+            print(f"[warn] VM {row.get('external_id', '?')}: {warning}", file=sys.stderr)
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=TEMPLATE_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
-
 
 def extract_vm(
     client: ProxmoxClient,
@@ -533,8 +731,13 @@ def extract_vm(
     resource: dict,
     backup_jobs: list[dict],
     volume_sizes: dict[str, int],
-    verified_at: str,
     status: str = "unknown",
+    local_node: str = "",
+    arp_map: Optional[dict[str, list[str]]] = None,
+    lease_ips: Optional[dict[str, list[str]]] = None,
+    lease_hosts: Optional[dict[str, str]] = None,
+    probe_enabled: bool = True,
+    ha_vmids: Optional[set[int]] = None,
 ) -> Optional[dict]:
     """Extract a single VM's inventory. Returns None on skip."""
     try:
@@ -545,7 +748,6 @@ def extract_vm(
 
     description = config.get("description", "")
     tags = parse_tags(config)
-
     # Disks
     disks = parse_disks(config, storage_meta, volume_sizes)
 
@@ -568,9 +770,25 @@ def extract_vm(
         except Exception as e:
             print(f"[warn] Guest agent IP fetch failed for VM {vmid}: {e}", file=sys.stderr)
 
-        if not ips:
-            ips = extract_ips_from_tags(tags)
+    if not ips:
+        ips = config_ips(config)
 
+    if not ips:
+        ips = extract_ips_from_tags(tags)
+
+    if not ips and probe_enabled and node == local_node:
+        macs = config_macs(config)
+        probe_ips: list[str] = []
+        for mac in macs:
+            for ip in (arp_map or {}).get(mac, []):
+                if ip not in probe_ips:
+                    probe_ips.append(ip)
+            for ip in (lease_ips or {}).get(mac, []):
+                if ip not in probe_ips:
+                    probe_ips.append(ip)
+        ips = probe_ips
+
+    if agent_live:
         try:
             os_info = client.get_guest_os(node, vmid)
         except Exception as e:
@@ -580,10 +798,30 @@ def extract_vm(
             fqdn = client.get_guest_fqdn(node, vmid)
         except Exception as e:
             print(f"[warn] Guest agent FQDN fetch failed for VM {vmid}: {e}", file=sys.stderr)
-    else:
-        ips = extract_ips_from_tags(tags)
+
     ips_by_role = classify_ips(ips)
 
+    # FQDN resolution fallbacks
+    macs = config_macs(config)
+    if not fqdn and probe_enabled and node == local_node and lease_hosts:
+        for mac in macs:
+            h = lease_hosts.get(mac, "")
+            if h and "." in h and not h.startswith("localhost"):
+                fqdn = h
+                break
+
+    if not fqdn and probe_enabled:
+        for ip in ips_by_role["private_ip"] + ips_by_role.get("backup_ip", []):
+            ptr = reverse_dns(ip)
+            if ptr:
+                fqdn = ptr
+                break
+
+    if not fqdn:
+        searchdomain = str(config.get("searchdomain", "")).strip()
+        vm_name = str(config.get("name") or resource.get("name") or "").strip()
+        if searchdomain and vm_name:
+            fqdn = f"{vm_name}.{searchdomain}"
     pool = str(resource.get("pool") or config.get("pool") or "")
     backup_enabled, backup_location = backup_coverage(backup_jobs, vmid, pool)
 
@@ -602,7 +840,7 @@ def extract_vm(
         resource=resource,
         backup_enabled=backup_enabled,
         backup_location=backup_location,
-        verified_at=verified_at,
+        ha_vmids=ha_vmids,
     )
 
 
@@ -623,14 +861,18 @@ def main() -> int:
         print(f"[error] Authentication failed: {e}", file=sys.stderr)
         return 1
 
-    cluster_name = client.get_cluster_name()
+    partial_failure = False
+
+    try:
+        cluster_name = client.get_cluster_name()
+    except Exception as e:
+        print(f"[warn] cluster status unavailable, using 'standalone': {e}", file=sys.stderr)
+        cluster_name = "standalone"
+        partial_failure = True
 
     nodes = client.get_nodes()
     if not nodes:
         print("[warn] No online nodes found", file=sys.stderr)
-
-    partial_failure = False
-
     try:
         backup_jobs = client.get_backup_jobs()
     except Exception as e:
@@ -638,7 +880,21 @@ def main() -> int:
         backup_jobs = []
         partial_failure = True
 
-    verified_at = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    local_node = socket.gethostname().split(".")[0]
+    probe_enabled = not args.no_probe
+    arp_map: dict[str, list[str]] = {}
+    lease_ips: dict[str, list[str]] = {}
+    lease_hosts: dict[str, str] = {}
+
+    try:
+        ha_vmids = client.get_ha_vmids()
+    except Exception as e:
+        print(f"[warn] Failed to fetch HA resources: {e}", file=sys.stderr)
+        ha_vmids = set()
+    if probe_enabled:
+        socket.setdefaulttimeout(args.probe_timeout)
+        arp_map = read_arp_table()
+        lease_ips, lease_hosts = read_dhcp_leases()
 
     all_rows: list[dict] = []
     storage_meta_cache: dict[str, dict[str, dict]] = {}
@@ -665,64 +921,47 @@ def main() -> int:
         print("[warn] cluster/resources returned no VMs, falling back to per-node enumeration", file=sys.stderr)
         partial_failure = True
         use_fallback = True
+    targets: list[tuple[str, int, str, dict]] = []
     if not use_fallback:
         for resource in cluster_vms:
-            vmid = resource.get("vmid")
-            if vmid is None:
-                continue
-            node = resource.get("node", "")
-            status = resource.get("status", "unknown")
-            storage_meta, volume_sizes = get_node_caches(node)
-            row = extract_vm(
-                client=client,
-                node=node,
-                vmid=vmid,
-                cluster_name=cluster_name,
-                storage_meta=storage_meta,
-                resource=resource,
-                backup_jobs=backup_jobs,
-                volume_sizes=volume_sizes,
-                verified_at=verified_at,
-                status=status,
-            )
-            if row is not None:
-                all_rows.append(row)
-            else:
-                partial_failure = True
+            if resource.get("vmid") is not None:
+                targets.append((resource.get("node", ""), resource["vmid"],
+                                resource.get("status", "unknown"), resource))
     else:
         for node in nodes:
-            storage_meta, volume_sizes = get_node_caches(node)
             try:
                 vms = client.get_vms_for_node(node)
             except Exception as e:
                 print(f"[warn] Failed to enumerate VMs on node {node}: {e}", file=sys.stderr)
                 partial_failure = True
                 continue
-
             for vm in vms:
-                vmid = vm.get("vmid")
-                if vmid is None:
-                    continue
-                status = vm.get("status", "unknown")
-                resource = vm
-                row = extract_vm(
-                    client=client,
-                    node=node,
-                    vmid=vmid,
-                    cluster_name=cluster_name,
-                    storage_meta=storage_meta,
-                    resource=resource,
-                    backup_jobs=backup_jobs,
-                    volume_sizes=volume_sizes,
-                    verified_at=verified_at,
-                    status=status,
-                )
-                if row is not None:
-                    all_rows.append(row)
-                else:
-                    partial_failure = True
+                if vm.get("vmid") is not None:
+                    targets.append((node, vm["vmid"], vm.get("status", "unknown"), vm))
 
-    # Determine output path
+    for node, vmid, status, resource in targets:
+        storage_meta, volume_sizes = get_node_caches(node)
+        row = extract_vm(
+            client=client,
+            node=node,
+            vmid=vmid,
+            cluster_name=cluster_name,
+            storage_meta=storage_meta,
+            resource=resource,
+            backup_jobs=backup_jobs,
+            volume_sizes=volume_sizes,
+            status=status,
+            local_node=local_node,
+            arp_map=arp_map,
+            lease_ips=lease_ips,
+            lease_hosts=lease_hosts,
+            probe_enabled=probe_enabled,
+            ha_vmids=ha_vmids,
+        )
+        if row is not None:
+            all_rows.append(row)
+        else:
+            partial_failure = True
     if args.output:
         output_path = args.output
     else:

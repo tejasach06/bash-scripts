@@ -2,10 +2,9 @@
 """
 Contract test: feed extractor output into InventoryMGR's normalize_csv_row.
 
-Usage: python3 contract_test.py /path/to/inventory.csv
+Usage: /home/tejas/Projects/InventoryMGR/backend/.venv/bin/python contract_test.py /path/to/inventory.csv
 
-Requires: InventoryMGR backend (origin/main commit ea6f8b6) available on PYTHONPATH.
-The module `app.services.csv_import_parsing` exists only in origin/main.
+Requires: InventoryMGR backend venv interpreter (uses app.services.csv_import).
 """
 import sys
 import csv
@@ -18,15 +17,17 @@ def run_contract_test(csv_path: str) -> int:
     sys.path.insert(0, str(inv_mgr))
 
     try:
-        from app.services.csv_import_parsing import normalize_csv_row, parse_csv_bytes
+        from app.services.csv_import import normalize_csv_row, parse_csv_bytes
     except ImportError as e:
-        print(f"[SKIP] InventoryMGR csv_import_parsing module not available: {e}", file=sys.stderr)
-        print("[INFO] This module exists in origin/main (ea6f8b6). Run against that version.", file=sys.stderr)
-        return 0
+        print(f"[FAIL] InventoryMGR csv_import not importable: {e}", file=sys.stderr)
+        return 1
 
     content = Path(csv_path).read_bytes()
-    rows, ignored = parse_csv_bytes(content)
-
+    try:
+        rows, ignored = parse_csv_bytes(content)
+    except Exception as e:
+        print(f"[FAIL] parse_csv_bytes failed: {e}", file=sys.stderr)
+        return 1
     if ignored:
         print(f"[FAIL] Ignored columns: {ignored}")
         return 1
