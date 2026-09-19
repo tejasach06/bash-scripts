@@ -12,7 +12,7 @@ Collection of production-ready scripts for system administration, security audit
 | [**pmta-log-extract**](./pmta-log-extract/) | Python | Stream-extract records from large PowerMTA accounting logs by sender/recipient |
 | [**proxmox-inventory-extract**](./proxmox-inventory-extract/) | Python | Extract VM inventory from Proxmox cluster via REST API, output CSV for InventoryMGR import |
 | [**checkmk-deploy-multisite**](./checkmk-deploy-multisite/) | Bash | Deploy Checkmk Central + Remote sites for monitoring Proxmox clusters on openSUSE |
-| [**sysdiag**](./sysdiag/) | Bash | Distro-agnostic read-only Linux diagnostics and RCA evidence collector with menu and report modes |
+| [**sysdiag**](./sysdiag/) | Bash | Apply a fixed security baseline (SSH banner, admin sudo user, idle timeout, IPv6 off, umask, monitoring packages, password policy) across Debian/RHEL/SUSE |
 
 ## Quick Navigation
 
@@ -64,7 +64,8 @@ sudo ./checkmk-deploy-multisite.sh
 ### Sysdiag
 ```bash
 cd sysdiag
-./sysdiag.sh --all --package --out /tmp/sysdiag-case
+# Edit SSH_BANNER_TEXT and LINUXTEAM_PASSWORD in harden.sh first
+sudo ./harden.sh
 ```
 [**→ Full README**](./sysdiag/README.md)
 
@@ -91,7 +92,7 @@ bash-scripts/
 │   ├── checkmk-deploy-multisite.sh
 │   └── README.md
 ├── sysdiag/
-│   ├── sysdiag.sh
+│   ├── harden.sh
 │   └── README.md
 ├── test_proxmox_inventory_extract.py    # Test suite for proxmox-inventory
 ├── test-script.sh                        # Generic test helper
