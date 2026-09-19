@@ -34,7 +34,7 @@ def test_parse_args_defaults():
     assert args.host == "127.0.0.1:8006"
     assert args.user == "root@pam"
     assert args.password == "secret"
-    assert args.insecure is False
+    assert args.verify_ssl is False
     assert args.output is None
 
 
@@ -44,13 +44,13 @@ def test_parse_args_full():
         "-H", "10.0.0.5:8006",
         "-u", "admin@pve",
         "-p", "secret",
-        "--insecure",
+        "--verify-ssl",
     ])
     assert args.output == "/tmp/foo.csv"
     assert args.host == "10.0.0.5:8006"
     assert args.user == "admin@pve"
     assert args.password == "secret"
-    assert args.insecure is True
+    assert args.verify_ssl is True
 
 
 
@@ -1039,7 +1039,7 @@ def test_live_pve_host_payload_end_to_end(tmp_path, monkeypatch):
 
     monkeypatch.setattr("proxmox_inventory_extract.ProxmoxClient", LiveMockClient)
     out_csv = str(tmp_path / "live-mock.csv")
-    monkeypatch.setattr(sys, "argv", ["script", "--insecure", "-H", "127.0.0.1:8006", "-o", out_csv, "-p", "dummy"])
+    monkeypatch.setattr(sys, "argv", ["script", "-H", "127.0.0.1:8006", "-o", out_csv, "-p", "dummy"])
 
     ret = main()
     assert ret == 0

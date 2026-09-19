@@ -7,7 +7,7 @@ Extract VM inventory from a Proxmox cluster via REST API and write a CSV compati
 ```bash
 # On a Proxmox host (needs network access to API on port 8006)
 export PVE_PASSWORD="your-root-password"
-./proxmox-inventory-extract.py --insecure -o /tmp/inventory.csv
+./proxmox-inventory-extract.py -o /tmp/inventory.csv
 ```
 
 ## Options
@@ -18,7 +18,7 @@ export PVE_PASSWORD="your-root-password"
 | `-H, --host HOST:PORT` | Proxmox API endpoint | `127.0.0.1:8006` |
 | `-u, --user USER@REALM` | Proxmox username | `root@pam` |
 | `-p, --password PASS` | Password (or use `PVE_PASSWORD` env) | prompts interactively |
-| `--insecure` | Disable TLS cert verification | required for self-signed certs |
+| `--verify-ssl` | Verify the Proxmox TLS certificate | skipped (Proxmox ships a self-signed cert) |
 | `--version` | Show version and exit | — |
 | `--timeout SECONDS` | Per-request HTTP timeout | `30` |
 | `--no-probe` | Disable reverse DNS and local ARP/DHCP lease lookups | probing enabled |
@@ -145,13 +145,13 @@ Fallback: if guest agent not available, IPs extracted from Proxmox `tags` field 
 
 ```bash
 export PVE_PASSWORD="secret"
-./proxmox-inventory-extract.py --insecure -o /tmp/inventory.csv
+./proxmox-inventory-extract.py -o /tmp/inventory.csv
 ```
 
 ### Remote API host
 
 ```bash
-./proxmox-inventory-extract.py -H pve-cluster.example.com:8006 -u admin@pam -p "pass" --insecure -o inventory.csv
+./proxmox-inventory-extract.py -H pve-cluster.example.com:8006 -u admin@pam -p "pass" -o inventory.csv
 ```
 
 ### Cron job for daily inventory
@@ -160,7 +160,7 @@ export PVE_PASSWORD="secret"
 # /etc/cron.daily/proxmox-inventory
 #!/bin/bash
 export PVE_PASSWORD="$(cat /etc/pve-inv-pass)"
-/opt/scripts/proxmox-inventory-extract.py --insecure -o /var/log/inventory/proxmox-$(date +%F).csv
+/opt/scripts/proxmox-inventory-extract.py -o /var/log/inventory/proxmox-$(date +%F).csv
 ```
 
 ### Import into InventoryMGR
@@ -176,7 +176,7 @@ Validate generated CSV against InventoryMGR's actual parser (requires InventoryM
 
 ```bash
 # Generate test CSV
-./proxmox-inventory-extract.py --insecure -o /tmp/test-inventory.csv
+./proxmox-inventory-extract.py -o /tmp/test-inventory.csv
 
 # Run contract test (requires InventoryMGR backend at origin/main ea6f8b6)
 python3 contract_test.py /tmp/test-inventory.csv
@@ -234,8 +234,7 @@ Proxmox tags (from VM config `tags` field) are `;`-joined.
 ## Troubleshooting
 
 **SSL certificate verification failed**
-- Use `--insecure` for self-signed certs (typical on Proxmox)
-- Or add CA to system trust store
+- Pass `--verify-ssl` only once your Proxmox host has a trusted certificate; by default verification is skipped since Proxmox ships a self-signed cert
 
 **Authentication failed**
 - Verify username/realm: `root@pam`, `admin@pve`, `user@pam`

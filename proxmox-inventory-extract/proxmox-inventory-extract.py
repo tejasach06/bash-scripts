@@ -263,13 +263,13 @@ class ProxmoxClient:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Extract Proxmox VM inventory as InventoryMGR-compatible CSV",
-        epilog="example: PVE_PASSWORD=secret %(prog)s --insecure -o /tmp/inventory.csv",
+        epilog="example: PVE_PASSWORD=secret %(prog)s -o /tmp/inventory.csv",
     )
     parser.add_argument("-o", "--output", help="Output CSV path (default: /tmp/proxmox-inventory-<ts>.csv)")
     parser.add_argument("-H", "--host", default="127.0.0.1:8006", help="Proxmox API endpoint (default: %(default)s)")
     parser.add_argument("-u", "--user", default="root@pam", help="Proxmox username (default: %(default)s)")
     parser.add_argument("-p", "--password", help="Password (or use PVE_PASSWORD env)")
-    parser.add_argument("--insecure", action="store_true", help="Disable TLS cert verification")
+    parser.add_argument("--verify-ssl", action="store_true", help="Verify the Proxmox TLS certificate (default: skipped, since Proxmox ships a self-signed cert)")
     parser.add_argument("--version", action="version", version="proxmox-inventory-extract 2026-08-15")
     parser.add_argument("--timeout", type=int, default=API_TIMEOUT, help="Per-request HTTP timeout in seconds (default: %(default)s)")
     parser.add_argument("--no-probe", action="store_true", help="Disable reverse DNS and local ARP/DHCP lease lookups")
@@ -857,7 +857,7 @@ def main() -> int:
         host=args.host,
         user=args.user,
         password=password,
-        verify_ssl=not args.insecure,
+        verify_ssl=args.verify_ssl,
         timeout=args.timeout,
     )
     try:
