@@ -20,6 +20,11 @@ export PVE_PASSWORD="your-root-password"
 | `-p, --password PASS` | Password (or use `PVE_PASSWORD` env) | prompts interactively |
 | `--insecure` | Disable TLS cert verification | required for self-signed certs |
 | `--version` | Show version and exit | — |
+| `--timeout SECONDS` | Per-request HTTP timeout | `30` |
+| `--no-probe` | Disable reverse DNS and local ARP/DHCP lease lookups | probing enabled |
+| `--probe-timeout SECONDS` | Reverse DNS timeout | `2.0` |
+| `--workers N` | Concurrent VM extraction workers | `8` |
+| `--quiet` | Suppress the progress line | progress shown on a TTY |
 | `--help` | Show help and exit | — |
 
 ## Password Precedence
@@ -48,7 +53,7 @@ Matches InventoryMGR's `TEMPLATE_COLUMNS` exactly (39 columns in fixed order):
 | `cpu_cores` | VM config cores x sockets (each defaults to 1) |
 | `memory_mb` | VM config `memory` |
 | `disks` | `;`-separated `disk_name:size_GiB:storage_name:storage_type` |
-| `storage_name` | *(empty — per-disk storage in `disks` column)* |
+| `storage_name` | Sum of all disk sizes (GiB) across `disks` column |
 | `storage_type` | *(empty — per-disk storage in `disks` column)* |
 | `os_family` | Guest agent OS family > `ostype` mapping > `linux` |
 | `os_distribution` | Guest agent distribution name |

@@ -8,6 +8,7 @@ compatible with InventoryMGR's bulk import schema.
 Runs directly on a Proxmox host; authenticates as root@pam via the ticket API.
 """
 import argparse
+import concurrent.futures
 import csv
 import dataclasses
 import datetime
@@ -19,6 +20,8 @@ import re
 import socket
 import ssl
 import sys
+import threading
+import time
 import urllib.parse
 import urllib.request
 from typing import Any, Optional
@@ -260,17 +263,19 @@ class ProxmoxClient:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Extract Proxmox VM inventory as InventoryMGR-compatible CSV",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog="example: PVE_PASSWORD=secret %(prog)s --insecure -o /tmp/inventory.csv",
     )
     parser.add_argument("-o", "--output", help="Output CSV path (default: /tmp/proxmox-inventory-<ts>.csv)")
-    parser.add_argument("-H", "--host", default="127.0.0.1:8006", help="Proxmox API endpoint")
-    parser.add_argument("-u", "--user", default="root@pam", help="Proxmox username")
+    parser.add_argument("-H", "--host", default="127.0.0.1:8006", help="Proxmox API endpoint (default: %(default)s)")
+    parser.add_argument("-u", "--user", default="root@pam", help="Proxmox username (default: %(default)s)")
     parser.add_argument("-p", "--password", help="Password (or use PVE_PASSWORD env)")
     parser.add_argument("--insecure", action="store_true", help="Disable TLS cert verification")
     parser.add_argument("--version", action="version", version="proxmox-inventory-extract 2026-08-15")
-    parser.add_argument("--timeout", type=int, default=API_TIMEOUT, help="Per-request HTTP timeout in seconds")
+    parser.add_argument("--timeout", type=int, default=API_TIMEOUT, help="Per-request HTTP timeout in seconds (default: %(default)s)")
     parser.add_argument("--no-probe", action="store_true", help="Disable reverse DNS and local ARP/DHCP lease lookups")
-    parser.add_argument("--probe-timeout", type=float, default=2.0, help="Reverse DNS timeout in seconds")
+    parser.add_argument("--probe-timeout", type=float, default=2.0, help="Reverse DNS timeout in seconds (default: %(default)s)")
+    parser.add_argument("--workers", type=int, default=8, help="Concurrent VM extraction workers (default: %(default)s)")
+    parser.add_argument("--quiet", action="store_true", help="Suppress the progress line")
     return parser.parse_args(argv)
 
 
@@ -670,7 +675,7 @@ def serialize_vm(
     row["cpu_cores"] = total_vcpus(config) or resource_num(resource, "maxcpu")
     row["memory_mb"] = str(config.get("memory") or "") or resource_num(resource, "maxmem", 1024 * 1024)
     row["disks"] = MULTI_SEP.join(d.to_csv_field() for d in disks)
-    row["storage_name"] = ""  # per-disk storage in disks column
+    row["storage_name"] = str(sum(d.size_gib for d in disks)) if disks else ""
     row["storage_type"] = ""
 
     # OS
@@ -939,8 +944,30 @@ def main() -> int:
                 if vm.get("vmid") is not None:
                     targets.append((node, vm["vmid"], vm.get("status", "unknown"), vm))
 
-    for node, vmid, status, resource in targets:
-        storage_meta, volume_sizes = get_node_caches(node)
+    # Node caches mutate shared dicts; warm them sequentially before fanning
+    # out per-VM extraction so concurrent workers only ever read them.
+    for node in dict.fromkeys(t[0] for t in targets):
+        get_node_caches(node)
+
+    total = len(targets)
+    completed = 0
+    progress_lock = threading.Lock()
+    show_progress = not args.quiet and sys.stderr.isatty()
+    start = time.monotonic()
+
+    def report_progress(vmid: int) -> None:
+        nonlocal completed
+        with progress_lock:
+            completed += 1
+            n = completed
+        if show_progress:
+            elapsed = time.monotonic() - start
+            print(f"\r[{n}/{total}] vm {vmid} ({elapsed:.1f}s)" + " " * 10,
+                  end="", file=sys.stderr, flush=True)
+
+    def run_extract(target: tuple[str, int, str, dict]) -> Optional[dict]:
+        node, vmid, status, resource = target
+        storage_meta, volume_sizes = storage_meta_cache[node], volume_sizes_cache[node]
         row = extract_vm(
             client=client,
             node=node,
@@ -958,6 +985,19 @@ def main() -> int:
             probe_enabled=probe_enabled,
             ha_vmids=ha_vmids,
         )
+        report_progress(vmid)
+        return row
+
+    results: list[Optional[dict]] = [None] * total
+    if total:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            futures = {pool.submit(run_extract, target): i for i, target in enumerate(targets)}
+            for future in concurrent.futures.as_completed(futures):
+                results[futures[future]] = future.result()
+    if show_progress:
+        print(file=sys.stderr)
+
+    for row in results:
         if row is not None:
             all_rows.append(row)
         else:
