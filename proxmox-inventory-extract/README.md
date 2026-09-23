@@ -2,7 +2,48 @@
 
 Extract VM inventory from a Proxmox cluster via REST API and write a CSV compatible with **InventoryMGR's bulk import schema**.
 
+Implemented in high-performance **Rust** with concurrent extraction workers, with a reference **Python 3** implementation included.
+
+## Build (Rust)
+
+Build the optimized release binary using Cargo:
+
+```bash
+cargo build --release
+```
+
+The compiled binary is written to `target/release/proxmox-inventory-extract`.
+
+Run the test suite and linter:
+
+```bash
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
 ## Quick Start
+
+### Rust Binary
+
+```bash
+# Ticket authentication with environment variable
+export PVE_PASSWORD="your-root-password"
+./target/release/proxmox-inventory-extract -o /tmp/inventory.csv
+
+# Ticket authentication with CLI flag
+./target/release/proxmox-inventory-extract -p "your-root-password" -o /tmp/inventory.csv
+
+# API Token authentication with CLI flag
+./target/release/proxmox-inventory-extract \
+  --api-token "root@pam!inventory=12345678-1234-1234-1234-123456789abc" \
+  -o /tmp/inventory.csv
+
+# API Token authentication with environment variable
+export PVE_API_TOKEN="root@pam!inventory=12345678-1234-1234-1234-123456789abc"
+./target/release/proxmox-inventory-extract -o /tmp/inventory.csv
+```
+
+### Python Script
 
 ```bash
 # On a Proxmox host (needs network access to API on port 8006)
@@ -17,21 +58,26 @@ export PVE_PASSWORD="your-root-password"
 | `-o, --output PATH` | Output CSV path | `/tmp/proxmox-inventory-<ts>.csv` |
 | `-H, --host HOST:PORT` | Proxmox API endpoint | `127.0.0.1:8006` |
 | `-u, --user USER@REALM` | Proxmox username | `root@pam` |
-| `-p, --password PASS` | Password (or use `PVE_PASSWORD` env) | prompts interactively |
+| `-p, --password PASS` | Password for ticket auth (or use `PVE_PASSWORD` env) | prompts interactively if TTY |
+| `--api-token TOKEN` | Proxmox API Token (or use `PVE_API_TOKEN` env) | — |
 | `--verify-ssl` | Verify the Proxmox TLS certificate | skipped (Proxmox ships a self-signed cert) |
-| `--version` | Show version and exit | — |
-| `--timeout SECONDS` | Per-request HTTP timeout | `30` |
+| `--timeout SECONDS` | Per-request HTTP timeout in seconds | `30` |
 | `--no-probe` | Disable reverse DNS and local ARP/DHCP lease lookups | probing enabled |
-| `--probe-timeout SECONDS` | Reverse DNS timeout | `2.0` |
+| `--probe-timeout SECONDS` | Reverse DNS timeout in seconds | `2.0` |
 | `--workers N` | Concurrent VM extraction workers | `8` |
 | `--quiet` | Suppress the progress line | progress shown on a TTY |
-| `--help` | Show help and exit | — |
+| `-V, --version` | Show version and exit | — |
+| `-h, --help` | Show help and exit | — |
 
-## Password Precedence
+## Authentication Precedence
 
-1. `-p` CLI argument
-2. `PVE_PASSWORD` environment variable
-3. Interactive `getpass` prompt
+Credentials are automatically resolved according to strict precedence:
+
+1. `--api-token` CLI argument
+2. `PVE_API_TOKEN` environment variable
+3. `-p, --password` CLI argument
+4. `PVE_PASSWORD` environment variable
+5. Interactive password prompt (if stdin is a TTY)
 
 ## Output CSV Schema
 
@@ -67,9 +113,9 @@ Matches InventoryMGR's `TEMPLATE_COLUMNS` exactly (39 columns in fixed order):
 | `applications` | *(empty — not available from Proxmox)* |
 | `monitoring_enabled` | *(empty — not available from Proxmox)* |
 | `pmp_enabled` | *(empty — not available from Proxmox)* |
-| `ha_enabled` | *(empty — not available from Proxmox)* |
-| `backup_enabled` | *(empty — not available from Proxmox)* |
-| `backup_location` | *(empty — not available from Proxmox)* |
+| `ha_enabled` | `true` if VM is configured in Proxmox HA (`/cluster/ha/resources`), else `false` |
+| `backup_enabled` | `true` if VM is covered by a cluster backup job (`/cluster/backup`), else `false` |
+| `backup_location` | Proxmox backup storage target ID if backed up, else empty |
 | `tags` | Proxmox tags, `;`-joined |
 | `last_patch_date` | *(empty — not available from Proxmox)* |
 | `last_vuln_scan_date` | *(empty — not available from Proxmox)* |
@@ -80,7 +126,7 @@ Matches InventoryMGR's `TEMPLATE_COLUMNS` exactly (39 columns in fixed order):
 
 All 39 InventoryMGR columns are emitted; unused columns are empty strings.
 
-## Disk Format (Updated)
+## Disk Format
 
 Disks are emitted as `;`-separated entries with **four fields per disk**:
 
@@ -91,9 +137,9 @@ disk_name:size_GiB:storage_name:storage_type
 | Field | Description |
 |-------|-------------|
 | `disk_name` | `{lv_name}-{config_key}` e.g. `vm-100-disk-0-scsi0` |
-| `size_GiB` | Integer size in GiB (from `size=` in Proxmox config) |
+| `size_GiB` | Integer size in GiB (from `size=` in Proxmox config, sub-GiB non-zero sizes round up to 1 GiB) |
 | `storage_name` | Storage `vgname` if available; otherwise Proxmox storage ID |
-| `storage_type` | Proxmox storage plugin type (e.g., `lvm`, `lvm-thin`, `iscsi`, `rbd`, `dir`) |
+| `storage_type` | Proxmox storage plugin type (e.g., `lvm`, `lvm-thin`, `zfspool`, `iscsi`, `rbd`, `dir`) |
 
 **Example:**
 
@@ -101,10 +147,9 @@ disk_name:size_GiB:storage_name:storage_type
 vm-100-disk-0-scsi0:50:vg01:lvm;vm-100-disk-1-scsi1:100:vg01:lvm;vm-100-disk-2-virtio0:32:vg02:lvm-thin
 ```
 
-**Key changes from previous version:**
-- Per-disk `storage_name` and `storage_type` fields (no longer plugin-prefixed in disk name)
+- Per-disk `storage_name` and `storage_type` fields
 - `vgname` preferred; falls back to Proxmox storage ID
-- EFI and TPM disks included (sub-GiB non-zero sizes round up to 1 GiB)
+- EFI (`efidisk*`) and TPM (`tpmstate*`) disks included
 - CDROM (`media=cdrom`) and `none` entries skipped
 
 ## IP Classification
@@ -118,11 +163,11 @@ Guest agent IPs are classified by prefix (longest match wins):
 | `202.` | `public_ip` |
 | other | `private_ip` |
 
-Fallback: if guest agent not available, IPs extracted from Proxmox `tags` field via regex.
+Fallback: if guest agent is not available, IPs are extracted from Proxmox `tags` field via regex, or probed via local ARP table and DHCP leases if running on the local Proxmox node.
 
-## FQDN Behavior (Updated)
+## FQDN Behavior
 
-`fqdn` is populated **only** when the QEMU Guest Agent returns a dotted hostname (contains `.` and not `localhost`). Short hostnames are rejected. If guest agent is unavailable or returns no hostname, `fqdn` is blank.
+`fqdn` is populated **only** when the QEMU Guest Agent returns a dotted hostname (contains `.` and not `localhost`). Short hostnames are rejected. If guest agent is unavailable or returns no dotted hostname, reverse DNS and local DHCP lease hostnames are consulted before falling back to `<name>.<searchdomain>`.
 
 ## Exit Codes
 
@@ -135,32 +180,37 @@ Fallback: if guest agent not available, IPs extracted from Proxmox `tags` field 
 ## Requirements
 
 - **Runs on a Proxmox host** (or machine with API access to port 8006)
-- Proxmox VE 7.x / 8.x
-- Python 3.11+ (standard library only)
-- `root@pam` credentials (or user with `VM.Audit` + `Datastore.Audit`)
+- Proxmox VE 7.x / 8.x / 9.x
+- Rust 1.80+ (for building the Rust binary)
+- Python 3.11+ (if running the reference Python script)
+- `root@pam` credentials (or user/token with `VM.Audit` + `Datastore.Audit`)
 
 ## Examples
 
-### Basic inventory
+### Basic inventory with Rust binary
 
 ```bash
 export PVE_PASSWORD="secret"
-./proxmox-inventory-extract.py -o /tmp/inventory.csv
+./target/release/proxmox-inventory-extract -o /tmp/inventory.csv
 ```
 
-### Remote API host
+### Remote API host with API token
 
 ```bash
-./proxmox-inventory-extract.py -H pve-cluster.example.com:8006 -u admin@pam -p "pass" -o inventory.csv
+./target/release/proxmox-inventory-extract \
+  -H pve-cluster.example.com:8006 \
+  -u admin@pam \
+  --api-token "admin@pam!token=a1b2c3d4-e5f6-7890-abcd-ef1234567890" \
+  -o inventory.csv
 ```
 
-### Cron job for daily inventory
+### Daily cron job
 
 ```bash
 # /etc/cron.daily/proxmox-inventory
 #!/bin/bash
-export PVE_PASSWORD="$(cat /etc/pve-inv-pass)"
-/opt/scripts/proxmox-inventory-extract.py -o /var/log/inventory/proxmox-$(date +%F).csv
+export PVE_API_TOKEN="$(cat /etc/pve-inv-token)"
+/opt/bin/proxmox-inventory-extract -o /var/log/inventory/proxmox-$(date +%F).csv
 ```
 
 ### Import into InventoryMGR
@@ -170,13 +220,13 @@ export PVE_PASSWORD="$(cat /etc/pve-inv-pass)"
 inventorymgr import /tmp/inventory.csv
 ```
 
-## Contract Testing (New)
+## Contract Testing
 
 Validate generated CSV against InventoryMGR's actual parser (requires InventoryMGR origin/main):
 
 ```bash
 # Generate test CSV
-./proxmox-inventory-extract.py -o /tmp/test-inventory.csv
+./target/release/proxmox-inventory-extract -o /tmp/test-inventory.csv
 
 # Run contract test (requires InventoryMGR backend at origin/main ea6f8b6)
 python3 contract_test.py /tmp/test-inventory.csv
@@ -188,23 +238,24 @@ The contract test:
 - Reports `[PASS]` with row count on success
 - See `contract_test.py` for details
 
-**InventoryMGR compatibility:** Uses `app.services.csv_import` module from InventoryMGR backend.
-
 ## How It Works
 
-1. **Authenticate** — POST `/api2/json/access/ticket` with username/password
+1. **Authenticate** — Ticket auth (`POST /api2/json/access/ticket`) or API Token auth (`Authorization: PVEAPIToken=...`)
 2. **Get cluster status** — `/api2/json/cluster/status` for cluster name
 3. **Enumerate nodes** — `/api2/json/nodes` (online only)
-4. **Enumerate QEMU VMs per node** — `/api2/json/nodes/<node>/qemu` (LXC containers are excluded)
-5. **Get VM config** — `/api2/json/nodes/<node>/qemu/<vmid>/config`
-6. **Get storage config** — `/api2/json/nodes/<node>/storage` (for `vgname`/`type`)
-7. **Get guest agent info** (if agent enabled):
-   - `/api2/json/nodes/<node>/qemu/<vmid>/agent/network-get-interfaces`
-   - `/api2/json/nodes/<node>/qemu/<vmid>/agent/get-osinfo`
-   - `/api2/json/nodes/<node>/qemu/<vmid>/agent/get-host-name`
-8. **Parse disks** — extract LV name, size, storage from config keys (`scsi*`, `virtio*`, `sata*`, `ide*`, `efidisk*`, `tpmstate*`)
-9. **Build CSV row** — map all fields to InventoryMGR `TEMPLATE_COLUMNS` order
-10. **Write CSV** — emit all 39 columns in correct order
+4. **Enumerate backup & HA jobs** — `/api2/json/cluster/backup` and `/api2/json/cluster/ha/resources`
+5. **Enumerate QEMU VMs** — `/api2/json/cluster/resources?type=vm` (with fallback to `/api2/json/nodes/<node>/qemu`)
+6. **Fetch storage config & volume sizes** — `/api2/json/nodes/<node>/storage` and `/storage/<id>/content?content=images`
+7. **Extract VM details in parallel workers**:
+   - VM config: `/api2/json/nodes/<node>/qemu/<vmid>/config`
+   - Guest agent info: `/agent/info`
+   - Guest network interfaces: `/agent/network-get-interfaces`
+   - Guest OS info: `/agent/get-osinfo`
+   - Guest hostname: `/agent/get-host-name`
+8. **Parse disks & calculate storage**: extract LV name, size, storage from config keys (`scsi*`, `virtio*`, `sata*`, `ide*`, `efidisk*`, `tpmstate*`)
+9. **Build & sanitize CSV row**: validate data types and blank invalid enum values
+10. **Write CSV**: emit all 39 columns in exact RFC 4180 format
+
 ## Special Handling
 
 ### Disk Parsing
@@ -257,14 +308,37 @@ Proxmox tags (from VM config `tags` field) are `;`-joined.
 
 ```
 proxmox-inventory-extract/
-├── proxmox-inventory-extract.py      # Main extractor
-├── test_proxmox_inventory_extract.py # Unit tests (17 tests)
+├── Cargo.toml                        # Rust package manifest
+├── src/
+│   ├── main.rs                       # Entrypoint
+│   ├── lib.rs                        # Library root
+│   ├── cli.rs                        # CLI argument parsing & credential resolution
+│   ├── client.rs                     # Proxmox REST API client (Ticket & API Token)
+│   ├── extractor.rs                  # Concurrent extraction engine & orchestrator
+│   ├── model.rs                      # Data models, disk parser & IP classifier
+│   ├── probe.rs                      # Local ARP/DHCP lease parser & reverse DNS
+│   └── csv.rs                        # Row sanitization & RFC 4180 CSV serializer
+├── tests/
+│   ├── cli_test.rs                   # CLI & credential resolution tests
+│   ├── client_test.rs                # HTTP client & auth tests
+│   ├── csv_test.rs                   # CSV serialization & sanitization tests
+│   ├── extractor_test.rs             # VM extraction engine tests
+│   ├── model_test.rs                 # Parsing & classification tests
+│   ├── probe_test.rs                 # Local probe tests
+│   └── parity_test.rs                # Live PVE 9.2.10 mock parity test
+├── proxmox-inventory-extract.py      # Reference Python extractor
+├── test_proxmox_inventory_extract.py # Python unit tests
 ├── contract_test.py                  # Cross-repo contract test
 ├── conftest.py                       # pytest loader for hyphen-named script
-└── README.md                         # This file
+└── README.md                         # Documentation
 ```
 
-Run unit tests:
+### Running Tests
+
 ```bash
+# Rust test suite
+cargo test
+
+# Python test suite
 python3 -m pytest test_proxmox_inventory_extract.py -v
 ```
