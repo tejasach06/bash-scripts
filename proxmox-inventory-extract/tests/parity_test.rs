@@ -381,8 +381,8 @@ async fn test_live_pve_host_payload_end_to_end_ticket_auth() {
         r.get("disks").unwrap(),
         "vm-101-disk-0-efidisk0:1:ZPOOL:zfspool;vm-101-disk-1-scsi0:500:ZPOOL:zfspool"
     );
-    assert_eq!(r.get("storage_name").unwrap(), "501");
-    assert_eq!(r.get("storage_type").unwrap(), "");
+    assert_eq!(r.get("storage_name").unwrap(), "ZPOOL");
+    assert_eq!(r.get("storage_type").unwrap(), "zfspool");
     assert_eq!(r.get("os_family").unwrap(), "linux");
     assert_eq!(
         r.get("os_distribution").unwrap(),
@@ -483,7 +483,8 @@ async fn test_live_pve_host_payload_end_to_end_api_token_auth() {
     assert_eq!(r.get("external_id").unwrap(), "101");
     assert_eq!(r.get("cpu_cores").unwrap(), "6");
     assert_eq!(r.get("memory_mb").unwrap(), "4096");
-    assert_eq!(r.get("storage_name").unwrap(), "501");
+    assert_eq!(r.get("storage_name").unwrap(), "ZPOOL");
+    assert_eq!(r.get("storage_type").unwrap(), "zfspool");
     assert_eq!(r.get("os_family").unwrap(), "linux");
     assert_eq!(r.get("private_ip").unwrap(), "192.168.0.17");
 

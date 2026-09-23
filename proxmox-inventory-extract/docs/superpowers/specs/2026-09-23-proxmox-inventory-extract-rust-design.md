@@ -123,7 +123,8 @@ tempfile = "3.10"
 - Storage name in `DiskRecord`: `vgname` if non-empty, else fallback to `storage_id`.
 - Disk name: `{lv_name}-{config_key}`. E.g. `vm-100-disk-0-scsi0`.
 - Format in CSV `disks` column: `{disk_name}:{size_gib}:{storage_name}:{storage_type}` joined by `;`.
-- Format in CSV `storage_name` column: `sum(size_gib for all disks)` if disks exist, else `""`.
+- Format in CSV `storage_name` column: Primary/first disk's storage name (e.g. `vgname` or storage ID) if disks exist, else `""`.
+- Format in CSV `storage_type` column: Primary/first disk's storage type (e.g. `lvmthin`, `zfspool`) if disks exist, else `""`.
 
 ### 5.2 IP Address Filtering & Classification
 - `valid_ipv4(str)`:

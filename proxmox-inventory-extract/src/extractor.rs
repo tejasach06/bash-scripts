@@ -182,13 +182,16 @@ pub fn serialize_vm(
         .join(";");
     row.insert("disks".to_string(), disks_str);
 
-    let storage_name = if !disks.is_empty() {
-        disks.iter().map(|d| d.size_gib).sum::<u64>().to_string()
-    } else {
-        String::new()
-    };
+    let storage_name = disks
+        .first()
+        .map(|d| d.storage_name.clone())
+        .unwrap_or_default();
+    let storage_type = disks
+        .first()
+        .map(|d| d.storage_type.clone())
+        .unwrap_or_default();
     row.insert("storage_name".to_string(), storage_name);
-    row.insert("storage_type".to_string(), String::new());
+    row.insert("storage_type".to_string(), storage_type);
 
     // OS
     let ostype = config.get("ostype").and_then(|v| v.as_str()).unwrap_or("");

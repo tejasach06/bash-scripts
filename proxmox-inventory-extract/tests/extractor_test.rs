@@ -534,7 +534,8 @@ fn test_serialize_vm_direct() {
     assert_eq!(row.get("cpu_cores").unwrap(), "8");
     assert_eq!(row.get("memory_mb").unwrap(), "16384");
     assert_eq!(row.get("disks").unwrap(), "disk-0-scsi0:100:rpool:zfspool");
-    assert_eq!(row.get("storage_name").unwrap(), "100");
+    assert_eq!(row.get("storage_name").unwrap(), "rpool");
+    assert_eq!(row.get("storage_type").unwrap(), "zfspool");
     assert_eq!(row.get("os_family").unwrap(), "linux");
     assert_eq!(row.get("os_distribution").unwrap(), "Ubuntu 24.04");
     assert_eq!(row.get("os_version").unwrap(), "24.04");

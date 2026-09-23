@@ -675,8 +675,8 @@ def serialize_vm(
     row["cpu_cores"] = total_vcpus(config) or resource_num(resource, "maxcpu")
     row["memory_mb"] = str(config.get("memory") or "") or resource_num(resource, "maxmem", 1024 * 1024)
     row["disks"] = MULTI_SEP.join(d.to_csv_field() for d in disks)
-    row["storage_name"] = str(sum(d.size_gib for d in disks)) if disks else ""
-    row["storage_type"] = ""
+    row["storage_name"] = disks[0].storage_name if disks else ""
+    row["storage_type"] = disks[0].storage_type if disks else ""
 
     # OS
     ostype = config.get("ostype", "")

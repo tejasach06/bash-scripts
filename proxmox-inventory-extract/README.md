@@ -99,8 +99,8 @@ Matches InventoryMGR's `TEMPLATE_COLUMNS` exactly (39 columns in fixed order):
 | `cpu_cores` | VM config cores x sockets (each defaults to 1) |
 | `memory_mb` | VM config `memory` |
 | `disks` | `;`-separated `disk_name:size_GiB:storage_name:storage_type` |
-| `storage_name` | Sum of all disk sizes (GiB) across `disks` column |
-| `storage_type` | *(empty — per-disk storage in `disks` column)* |
+| `storage_name` | Primary/first disk's storage name (e.g. `vgname` or storage ID) |
+| `storage_type` | Primary/first disk's storage type (e.g. `lvmthin`, `zfspool`) |
 | `os_family` | Guest agent OS family > `ostype` mapping > `linux` |
 | `os_distribution` | Guest agent distribution name |
 | `os_version` | Guest agent version |
