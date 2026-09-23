@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod client;
 pub mod csv;
+pub mod extractor;
 pub mod model;
 pub mod probe;
