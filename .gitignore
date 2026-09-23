@@ -4,6 +4,9 @@ __pycache__/
 *.pyo
 .pytest_cache/
 
+# Rust
+target/
+
 # Temporary files
 *.tmp
 *.log
