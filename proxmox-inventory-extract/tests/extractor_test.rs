@@ -280,7 +280,7 @@ async fn test_extract_vm_running_with_agent() {
 
     let storage_meta = build_storage_meta(&client, "pve-node1").await;
     let sids: Vec<String> = storage_meta.keys().cloned().collect();
-    let volume_sizes = build_volume_sizes(&client, "pve-node1", &sids).await;
+    let volume_sizes = build_volume_sizes(&client, "pve-node1", &sids, 1).await;
 
     let resource = json!({
         "vmid": 101,
@@ -347,7 +347,7 @@ async fn test_extract_vm_stopped_with_cloudinit_ips() {
 
     let storage_meta = build_storage_meta(&client, "pve-node1").await;
     let sids: Vec<String> = storage_meta.keys().cloned().collect();
-    let volume_sizes = build_volume_sizes(&client, "pve-node1", &sids).await;
+    let volume_sizes = build_volume_sizes(&client, "pve-node1", &sids, 1).await;
 
     let resource = json!({
         "vmid": 102,
@@ -788,3 +788,66 @@ async fn test_extract_vm_local_probe_arp_and_dhcp() {
     assert_eq!(row.get("fqdn").unwrap(), "probed-vm.local.lan");
 }
 
+#[tokio::test]
+async fn test_build_volume_sizes_concurrency_and_cap() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let in_flight = Arc::clone(&in_flight);
+        let peak = Arc::clone(&peak);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let in_flight = Arc::clone(&in_flight);
+                let peak = Arc::clone(&peak);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let path = request.split_whitespace().nth(1).unwrap();
+                    let storage = path
+                        .strip_prefix("/api2/json/nodes/test-node/storage/")
+                        .unwrap()
+                        .strip_suffix("/content?content=images")
+                        .unwrap();
+                    let size_gib = match storage {
+                        "a" => 10u64,
+                        "b" => 20,
+                        "c" => 30,
+                        _ => panic!("unexpected storage: {storage}"),
+                    };
+                    let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(active, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    let body = json!({
+                        "data": [{"volid": format!("{storage}:disk"), "size": size_gib * 1024 * 1024 * 1024}]
+                    }).to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        })
+    };
+    let client = ProxmoxClient::new(
+        &format!("http://{addr}"),
+        AuthMethod::ApiToken { token: "test".to_string() },
+        false,
+        5,
+    ).unwrap();
+    let storage_ids = ["a", "b", "c"].map(str::to_string);
+    let sizes = build_volume_sizes(&client, "test-node", &storage_ids, 2).await;
+    server.abort();
+    assert_eq!(sizes.get("a:disk"), Some(&10));
+    assert_eq!(sizes.get("b:disk"), Some(&20));
+    assert_eq!(sizes.get("c:disk"), Some(&30));
+    assert_eq!(peak.load(Ordering::SeqCst), 2);
+}

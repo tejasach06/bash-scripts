@@ -64,7 +64,7 @@ export PVE_PASSWORD="your-root-password"
 | `--timeout SECONDS` | Per-request HTTP timeout in seconds | `30` |
 | `--no-probe` | Disable reverse DNS and local ARP/DHCP lease lookups | probing enabled |
 | `--probe-timeout SECONDS` | Reverse DNS timeout in seconds | `2.0` |
-| `--workers N` | Concurrent VM extraction workers | `8` |
+| `--workers N` | Concurrent VM extraction workers and per-node storage-content requests | `8` |
 | `--quiet` | Suppress the progress line | progress shown on a TTY |
 | `-V, --version` | Show version and exit | — |
 | `-h, --help` | Show help and exit | — |
@@ -245,7 +245,7 @@ The contract test:
 3. **Enumerate nodes** — `/api2/json/nodes` (online only)
 4. **Enumerate backup & HA jobs** — `/api2/json/cluster/backup` and `/api2/json/cluster/ha/resources`
 5. **Enumerate QEMU VMs** — `/api2/json/cluster/resources?type=vm` (with fallback to `/api2/json/nodes/<node>/qemu`)
-6. **Fetch storage config & volume sizes** — `/api2/json/nodes/<node>/storage` and `/storage/<id>/content?content=images`
+6. **Fetch storage config & volume sizes** — `/api2/json/nodes/<node>/storage`, then fetch its storage content endpoints concurrently (up to `--workers` requests per node)
 7. **Extract VM details in parallel workers**:
    - VM config: `/api2/json/nodes/<node>/qemu/<vmid>/config`
    - Guest agent info: `/agent/info`

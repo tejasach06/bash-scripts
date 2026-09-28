@@ -52,35 +52,57 @@ pub async fn build_volume_sizes(
     client: &ProxmoxClient,
     node: &str,
     storage_ids: &[String],
+    workers: usize,
 ) -> HashMap<String, u64> {
     let mut sizes = HashMap::new();
+    if storage_ids.is_empty() {
+        return sizes;
+    }
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(workers.max(1)));
+    let client = Arc::new(client.clone());
+    let node_shared: Arc<str> = Arc::from(node);
+    let mut handles = Vec::with_capacity(storage_ids.len());
     for sid in storage_ids {
-        let content = match client.get_storage_content(node, sid).await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "[warn] Failed to fetch content for storage {} on {}: {}",
-                    sid, node, e
-                );
-                continue;
-            }
-        };
-        for vol in content {
-            if let Some(volid) = vol.get("volid").and_then(|v| v.as_str()) {
-                if !volid.is_empty() {
-                    let size_bytes = vol.get("size").and_then(|s| {
-                        if let Some(n) = s.as_u64() {
-                            Some(n)
-                        } else if let Some(n) = s.as_i64() {
-                            Some(n.max(0) as u64)
-                        } else if let Some(str_val) = s.as_str() {
-                            str_val.parse::<u64>().ok()
-                        } else {
-                            None
-                        }
-                    }).unwrap_or(0);
-                    let gib = size_bytes / (1024 * 1024 * 1024);
-                    sizes.insert(volid.to_string(), gib);
+        let client = Arc::clone(&client);
+        let node = Arc::clone(&node_shared);
+        let sid = sid.clone();
+        let sem = Arc::clone(&semaphore);
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let content = client.get_storage_content(&node, &sid).await;
+            (sid, content)
+        }));
+    }
+
+    for handle in handles {
+        if let Ok((sid, content_result)) = handle.await {
+            let content = match content_result {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "[warn] Failed to fetch content for storage {} on {}: {}",
+                        sid, node, e
+                    );
+                    continue;
+                }
+            };
+            for vol in content {
+                if let Some(volid) = vol.get("volid").and_then(|v| v.as_str()) {
+                    if !volid.is_empty() {
+                        let size_bytes = vol.get("size").and_then(|s| {
+                            if let Some(n) = s.as_u64() {
+                                Some(n)
+                            } else if let Some(n) = s.as_i64() {
+                                Some(n.max(0) as u64)
+                            } else if let Some(str_val) = s.as_str() {
+                                str_val.parse::<u64>().ok()
+                            } else {
+                                None
+                            }
+                        }).unwrap_or(0);
+                        let gib = size_bytes / (1024 * 1024 * 1024);
+                        sizes.insert(volid.to_string(), gib);
+                    }
                 }
             }
         }
@@ -484,6 +506,18 @@ struct TargetVm {
     resource: serde_json::Value,
 }
 
+fn extract_vmid(value: &serde_json::Value) -> Option<u64> {
+    if let Some(n) = value.as_u64() {
+        Some(n)
+    } else if let Some(n) = value.as_i64() {
+        Some(n as u64)
+    } else if let Some(s) = value.as_str() {
+        s.parse::<u64>().ok()
+    } else {
+        None
+    }
+}
+
 /// Runs the complete application orchestration pipeline, returning exit code (0, 1, or 2).
 pub async fn run_orchestrator(args: Args) -> i32 {
     let auth = match resolve_credentials(&args) {
@@ -587,17 +621,7 @@ pub async fn run_orchestrator(args: Args) -> i32 {
     let mut targets: Vec<TargetVm> = Vec::new();
     if !use_fallback {
         for res in cluster_vms {
-            let vmid_opt = res.get("vmid").and_then(|v| {
-                if let Some(n) = v.as_u64() {
-                    Some(n)
-                } else if let Some(n) = v.as_i64() {
-                    Some(n as u64)
-                } else if let Some(s) = v.as_str() {
-                    s.parse::<u64>().ok()
-                } else {
-                    None
-                }
-            });
+            let vmid_opt = res.get("vmid").and_then(extract_vmid);
             if let Some(vmid) = vmid_opt {
                 let node = res
                     .get("node")
@@ -628,17 +652,7 @@ pub async fn run_orchestrator(args: Args) -> i32 {
                 }
             };
             for vm in vms {
-                let vmid_opt = vm.get("vmid").and_then(|v| {
-                    if let Some(n) = v.as_u64() {
-                        Some(n)
-                    } else if let Some(n) = v.as_i64() {
-                        Some(n as u64)
-                    } else if let Some(s) = v.as_str() {
-                        s.parse::<u64>().ok()
-                    } else {
-                        None
-                    }
-                });
+                let vmid_opt = vm.get("vmid").and_then(extract_vmid);
                 if let Some(vmid) = vmid_opt {
                     let status = vm
                         .get("status")
@@ -669,7 +683,7 @@ pub async fn run_orchestrator(args: Args) -> i32 {
     for node in &unique_nodes {
         let sm = build_storage_meta(&client, node).await;
         let sids: Vec<String> = sm.keys().cloned().collect();
-        let vs = build_volume_sizes(&client, node, &sids).await;
+        let vs = build_volume_sizes(&client, node, &sids, args.workers).await;
         storage_meta_cache.insert(node.clone(), sm);
         volume_sizes_cache.insert(node.clone(), vs);
     }
