@@ -1,119 +1,58 @@
 # bash-scripts
 
-Collection of production-ready scripts for system administration, security auditing, monitoring, and automation. Each script lives in its own directory with a dedicated README.
+Independent tools for remote execution, host diagnostics and hardening, monitoring deployment, and log and inventory export. Each directory has its own README. Review a tool's options and effects before running it on a host.
 
-## Scripts
+| Tool | Implementation | What it does |
+| --- | --- | --- |
+| [ssh-script-executor](ssh-script-executor/README.md) | Python | Runs local Bash scripts on SSH hosts concurrently and writes CSV or JSON results. |
+| [dirtyfrag](dirtyfrag/README.md) | Bash | Checks kernel and module indicators; optional mitigation blacklists modules and rebuilds initramfs. |
+| [fs-corruption-rca-collector](fs-corruption-rca-collector/README.md) | Python | Collects filesystem, storage, kernel, and Proxmox diagnostics into reports and an archive. |
+| [pmta-log-extract](pmta-log-extract/README.md) | Rust and Python | Filters PowerMTA accounting records and exports matching rows to CSV. |
+| [proxmox-inventory-extract](proxmox-inventory-extract/README.md) | Rust and Python | Exports Proxmox QEMU VM inventory to a 39-column InventoryMGR CSV. |
+| [checkmk-deploy-multisite](checkmk-deploy-multisite/README.md) | Bash | Configures Checkmk central and remote OMD sites through SSH. |
+| [sysdiag](sysdiag/README.md) | Bash | Applies a Linux host-hardening baseline; despite its name, it is not a diagnostic collector. |
 
-| Script | Language | Purpose |
-|--------|----------|---------|
-| [**ssh-script-executor**](./ssh-script-executor/) | Python | Execute local scripts on remote hosts via SSH with parallel execution, connection reuse, and CSV/JSON reporting |
-| [**dirtyfrag**](./dirtyfrag/) | Bash | Scan for and mitigate DirtyFrag/DirtClone CVE chain (CVE-2026-43284, 43500, 46300, 43503) |
-| [**fs-corruption-rca-collector**](./fs-corruption-rca-collector/) | Python | Collect comprehensive logs for filesystem corruption root cause analysis on Ubuntu/Proxmox |
-| [**pmta-log-extract**](./pmta-log-extract/) | Python | Stream-extract records from large PowerMTA accounting logs by sender/recipient |
-| [**proxmox-inventory-extract**](./proxmox-inventory-extract/) | Python | Extract VM inventory from Proxmox cluster via REST API, output CSV for InventoryMGR import |
-| [**checkmk-deploy-multisite**](./checkmk-deploy-multisite/) | Bash | Deploy Checkmk Central + Remote sites for monitoring Proxmox clusters on openSUSE |
-| [**sysdiag**](./sysdiag/) | Bash | Apply a fixed security baseline (SSH banner, admin sudo user, idle timeout, IPv6 off, umask, monitoring packages, password policy) across Debian/RHEL/SUSE |
+## Run a tool
 
-## Quick Navigation
+The tools have separate requirements. Use the linked README for setup and full options. The commands below run from the repository root.
 
-### SSH Script Executor
+### Remote scripts and diagnostics
+
+Preview an SSH run without connecting:
+
 ```bash
-cd ssh-script-executor
-./ssh-script-executor.py --host user@server --script ./deploy.sh --args "prod"
+python3 ssh-script-executor/ssh-script-executor.py --host user@server --script ssh-script-executor/test-script.sh --dry-run
 ```
-[**→ Full README**](./ssh-script-executor/README.md)
 
-### DirtyFrag Scanner
+Collect filesystem evidence on a Linux host. The collector writes its report under `/tmp` and an archive in the current directory; review the archive before sharing it.
+
 ```bash
-cd dirtyfrag
-./dirtyfrag-scanner.sh --verbose --csv report.csv
-sudo ./dirtyfrag-scanner.sh --mitigate --dry-run
+sudo python3 fs-corruption-rca-collector/fs-corruption-rca-collector.py
 ```
-[**→ Full README**](./dirtyfrag/README.md)
 
-### Filesystem Corruption RCA Collector
+### Rust exporters
+
+Build and run the Rust implementations with Cargo. The Python implementations remain in the same directories; Rust does not require Python.
+
 ```bash
-cd fs-corruption-rca-collector
-sudo ./fs-corruption-rca-collector.py
-```
-[**→ Full README**](./fs-corruption-rca-collector/README.md)
+cargo run --release --manifest-path pmta-log-extract/Cargo.toml -- \
+  --path '/var/log/pmta/acct-*.csv' --orig example.com --out matches.csv
 
-### PMTA Log Extract
-```bash
-cd pmta-log-extract
-./pmta-log-extract.py --orig "@example.com" --input /var/log/pmta/*.csv.gz --output matches.csv
-```
-[**→ Full README**](./pmta-log-extract/README.md)
-
-### Proxmox Inventory Extract
-```bash
-cd proxmox-inventory-extract
-export PVE_PASSWORD="your-password"
-./proxmox-inventory-extract.py --insecure -o /tmp/inventory.csv
-```
-[**→ Full README**](./proxmox-inventory-extract/README.md)
-
-### Checkmk Multi-Site Deployment
-```bash
-cd checkmk-deploy-multisite
-# Edit configuration in script first
-sudo ./checkmk-deploy-multisite.sh
-```
-[**→ Full README**](./checkmk-deploy-multisite/README.md)
-
-### Sysdiag
-```bash
-cd sysdiag
-# Edit SSH_BANNER_TEXT and LINUXTEAM_PASSWORD in harden.sh first
-sudo ./harden.sh
-```
-[**→ Full README**](./sysdiag/README.md)
-
-## Repository Structure
-
-```
-bash-scripts/
-├── ssh-script-executor/
-│   ├── ssh-script-executor.py
-│   └── README.md
-├── dirtyfrag/
-│   ├── dirtyfrag-scanner.sh
-│   └── README.md
-├── fs-corruption-rca-collector/
-│   ├── fs-corruption-rca-collector.py
-│   └── README.md
-├── pmta-log-extract/
-│   ├── pmta-log-extract.py
-│   └── README.md
-├── proxmox-inventory-extract/
-│   ├── proxmox-inventory-extract.py
-│   └── README.md
-├── checkmk-deploy-multisite/
-│   ├── checkmk-deploy-multisite.sh
-│   └── README.md
-├── sysdiag/
-│   ├── harden.sh
-│   └── README.md
-├── test_proxmox_inventory_extract.py    # Test suite for proxmox-inventory
-├── test-script.sh                        # Generic test helper
-├── conftest.py                           # Pytest configuration
-└── README.md                             # This file
+cargo run --release --manifest-path proxmox-inventory-extract/Cargo.toml -- \
+  -H pve.example.com:8006 -u inventory@pam -o inventory.csv
 ```
 
-## Common Requirements
+The PMTA example needs readable matching CSV files. For compressed PMTA inputs, consult the tool's column options. The Proxmox example requires API access and prompts for a password in an interactive terminal; you can also provide `PVE_API_TOKEN` or `PVE_PASSWORD` in the environment. The Rust Proxmox CLI does not verify TLS certificates by default; use `--verify-ssl` with a trusted certificate.
 
-- **Python** 3.10+ (for Python scripts)
-- **Bash** 4+ (for shell scripts)
-- **Linux** (tested on Ubuntu 22.04, Debian 12, openSUSE Leap 15.6+, RHEL 9)
-- Root/sudo for system-level operations
+### Host-changing scripts
 
-## Contributing
+Read the source and target-host configuration before running `dirtyfrag`, `checkmk-deploy-multisite`, or `sysdiag`. The DirtyFrag scanner and Checkmk deployment script have known CLI or execution defects; do not treat their documented commands as verified deployment procedures. DirtyFrag mitigation can change module loading and initramfs. Checkmk deployment targets root SSH sessions. `sysdiag/harden.sh` changes accounts, SSH, and system policy immediately when run as root; it has no dry-run mode, and `--help` does not prevent changes.
 
-1. Each script in its own directory with `README.md`
-2. Follow existing code style (type hints for Python, `set -euo pipefail` for Bash)
-3. Include `--help`, `--version`, `--selftest` where applicable
-4. Update this index README when adding new scripts
+## Requirements
 
-## License
+- Rust and Cargo for the two native exporters.
+- Python for the Python tools and retained exporter implementations. Version and optional dependencies vary by tool.
+- Bash and Linux host utilities for the shell tools. The SSH executor also needs an SSH client and Bash on its targets.
+- Appropriate host access for remote tools; privileged access for system-level collection or changes.
 
-MIT License — see individual script directories for details.
+No repository-wide installer or shared runtime is required.
